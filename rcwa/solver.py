@@ -12,7 +12,6 @@ ScatteringMatrix = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
 class Solver:
     """Modal RCWA solver using adjacent port bases."""
-
     @staticmethod
     def reorder_matrix(N: int) -> jnp.ndarray:
         """Map polarization-major ordering into harmonic-major field ordering."""
@@ -20,16 +19,6 @@ class Solver:
         size = 4 * num_h
         src = jnp.array([p * num_h + h for h in range(num_h) for p in range(4)])
         return jnp.eye(size, dtype=jnp.complex128)[src]
-
-    @staticmethod
-    def zero_order_mode_index(N: int, incident_pol: str) -> int:
-        """Return the flat TE/TM modal index for the zero diffraction order."""
-        zero = Stack.zero_harmonic_index(N)
-        if incident_pol == "TE":
-            return zero
-        if incident_pol == "TM":
-            return Stack.num_harmonics(N) + zero
-        raise ValueError(f"Unknown incident_pol={incident_pol!r}")
 
     @staticmethod
     def modes_to_fields_matrix(evecs: jnp.ndarray) -> jnp.ndarray:
@@ -95,17 +84,29 @@ class Solver:
         return eigenvalues, eigenvectors
 
     @staticmethod
-    def _basis_change_transfer_matrix(left_fields: jnp.ndarray, right_fields: jnp.ndarray) -> jnp.ndarray:
-        """Return the coefficient map from left basis amplitudes to right basis amplitudes."""
-        return jnp.linalg.solve(right_fields, left_fields)
-
-    @staticmethod
     def basis_change_scattering_matrix(
         left_fields: jnp.ndarray, right_fields: jnp.ndarray
     ) -> ScatteringMatrix:
+        def transfer_to_scattering(T: jnp.ndarray) -> ScatteringMatrix:
+            """Convert a 2x2-block transfer matrix into an S-matrix."""
+            half = T.shape[0] // 2
+            T11 = T[:half, :half]
+            T12 = T[:half, half:]
+            T21 = T[half:, :half]
+            T22 = T[half:, half:]
+
+            T22_inv_T21 = jnp.linalg.solve(T22, T21)
+            T22_inv = jnp.linalg.solve(T22, jnp.eye(half, dtype=T22.dtype))
+
+            S11 = -T22_inv_T21
+            S12 = T22_inv
+            S21 = T11 - T12 @ T22_inv_T21
+            S22 = T12 @ T22_inv
+            return S11, S12, S21, S22
+
         """Return the zero-thickness S-matrix for a change of adjacent modal basis."""
-        return Solver.transfer_to_scattering(
-            Solver._basis_change_transfer_matrix(left_fields, right_fields)
+        return transfer_to_scattering(
+            jnp.linalg.solve(right_fields, left_fields)
         )
 
     @staticmethod
@@ -137,23 +138,6 @@ class Solver:
         Z = jnp.zeros_like(X)
         return Z, X, X, Z
 
-    @staticmethod
-    def transfer_to_scattering(T: jnp.ndarray) -> ScatteringMatrix:
-        """Convert a 2x2-block transfer matrix into an S-matrix."""
-        half = T.shape[0] // 2
-        T11 = T[:half, :half]
-        T12 = T[:half, half:]
-        T21 = T[half:, :half]
-        T22 = T[half:, half:]
-
-        T22_inv_T21 = jnp.linalg.solve(T22, T21)
-        T22_inv = jnp.linalg.solve(T22, jnp.eye(half, dtype=T22.dtype))
-
-        S11 = -T22_inv_T21
-        S12 = T22_inv
-        S21 = T11 - T12 @ T22_inv_T21
-        S22 = T12 @ T22_inv
-        return S11, S12, S21, S22
 
     @staticmethod
     def redheffer_star_product(Sa: ScatteringMatrix, Sb: ScatteringMatrix) -> ScatteringMatrix:
@@ -212,21 +196,3 @@ class Solver:
             S_list.append(Solver.basis_change_scattering_matrix(layer_fields, right_fields))
 
         return Solver.chain_scattering_matrices(S_list)
-
-    @staticmethod
-    def reflection_transmission(
-        stack: Stack,
-        N: int,
-        incident_pol: str = "TE",
-        num_points: int = 2048,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Return reflected and transmitted modal amplitudes for normal incidence."""
-        S11, _, S21, _ = Solver.total_scattering_matrix(stack, N, num_points=num_points)
-        half = 2 * Stack.num_harmonics(N)
-
-        inc = jnp.zeros(half, dtype=jnp.complex128)
-        inc = inc.at[Solver.zero_order_mode_index(N, incident_pol)].set(1.0)
-
-        r = S11 @ inc
-        t = S21 @ inc
-        return r, t
