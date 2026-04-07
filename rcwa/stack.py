@@ -11,7 +11,18 @@ from .layer import Layer
 
 @dataclass
 class Stack:
-    """A stack of x-periodic layers between isotropic substrate and superstrate."""
+    """A stack of x-periodic layers between isotropic substrate and superstrate.
+
+    This class mainly orchestrates the construction of layer and half-space
+    RCWA operators. In the current rewrite, the layer-level operator is a full
+    matrix in the component-major basis
+
+        [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T
+
+    so any Q matrix returned by this file has shape
+
+        (4 * (2N + 1), 4 * (2N + 1)).
+    """
 
     layers: list[Layer] = field(default_factory=list)
     wavelength_nm: float = 0.0
@@ -58,7 +69,38 @@ class Stack:
     def layer_Q_matrix_normalized(
         self, layer_index: int, N: int, num_points: int = 512
     ) -> jnp.ndarray:
-        """Build the full layer Q matrix directly from Toeplitz material operators."""
+        """Build one layer's full normalized Q matrix.
+
+        Inputs:
+            layer_index:
+                Integer index into ``self.layers``.
+            N:
+                Fourier truncation order, so the harmonic orders are
+                ``n = -N, ..., N`` and the number of harmonics is
+                ``num_h = 2N + 1``.
+            num_points:
+                Number of real-space sample points used to compute the Fourier
+                coefficients of the material functions before those coefficients
+                are assembled into Toeplitz convolution matrices.
+
+        Output:
+            A dense complex matrix with shape ``(4 * num_h, 4 * num_h)``.
+
+        Contents of the output matrix:
+            This is the layer propagation operator in the component-major basis
+
+                [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
+
+            The matrix is built from:
+            - Toeplitz convolution matrices of shape ``(num_h, num_h)`` for the
+              reduced material quantities, and
+            - the diagonal harmonic wavevector matrix
+              ``K_x = diag(kappa_normalized + n * G_normalized)``.
+
+            Each of the 16 logical blocks in the 4x4 operator layout is itself
+            a ``(num_h, num_h)`` matrix acting on one field component across all
+            retained harmonics.
+        """
         toeplitz_matrices = self.layers[layer_index].build_toeplitz_fourier_matrices(
             N,
             num_points=num_points,
@@ -75,11 +117,40 @@ class Stack:
     def layer_Q_tensor_normalized(
         self, layer_index: int, N: int, num_points: int = 512
     ) -> jnp.ndarray:
-        """Compatibility wrapper while the rest of the rewrite is in progress."""
+        """Compatibility wrapper that currently returns the full Q matrix.
+
+        Historically this method returned a tensor with shape
+        ``(num_h, num_h, 4, 4)`` whose ``(n, m)`` entry was the 4x4 block
+        coupling harmonic ``m`` into harmonic ``n``.
+
+        In the rewrite, the layer code directly constructs the flattened full
+        matrix instead, so this method now returns the same object as
+        :meth:`layer_Q_matrix_normalized`:
+
+            shape ``(4 * num_h, 4 * num_h)``
+
+        in the component-major basis
+
+            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
+        """
         return self.layer_Q_matrix_normalized(layer_index, N, num_points=num_points)
 
     def build_all_Q_matrices_normalized(self, N: int, num_points: int = 512) -> list[jnp.ndarray]:
-        """Build each layer's full Q matrix without an intermediate tensor reshape."""
+        """Build the full normalized Q matrix for every physical layer.
+
+        Input:
+            N sets ``num_h = 2N + 1`` retained Fourier harmonics.
+
+        Output:
+            A Python list with ``len(self.layers)`` entries.
+
+            Each entry is a complex matrix with shape
+            ``(4 * num_h, 4 * num_h)`` in the basis
+
+                [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
+
+            There is no intermediate tensor representation in this path.
+        """
         return [
             self.layer_Q_matrix_normalized(i, N, num_points=num_points)
             for i in range(len(self.layers))
@@ -91,7 +162,28 @@ class Stack:
         N: int,
         num_points: int = 512,
     ) -> jnp.ndarray:
-        """Build a uniform-medium Q matrix through the same layer-level Q pipeline."""
+        """Build the full normalized Q matrix for a uniform isotropic medium.
+
+        Input:
+            eps:
+                Scalar dielectric constant for an isotropic medium. It is
+                converted to the 3x3 tensor ``eps * I`` before entering the
+                layer-level material pipeline.
+            N:
+                Fourier truncation order giving ``num_h = 2N + 1`` harmonics.
+
+        Output:
+            A dense complex matrix with shape ``(4 * num_h, 4 * num_h)`` in the
+            same component-major basis used for layer Q matrices:
+
+                [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
+
+        Structure of the output:
+            Because the medium is uniform, every Toeplitz material matrix is
+            diagonal and the resulting full Q matrix is decoupled
+            harmonic-by-harmonic. After regrouping rows and columns by
+            harmonic, it consists of ``num_h`` independent 4x4 blocks.
+        """
         x_domain_nm = self.layers[0].x_domain_nm if self.layers else (0.0, 1.0)
         uniform_layer = Layer.uniform(
             thickness_nm=0.0,
@@ -112,6 +204,18 @@ class Stack:
         )
 
     def get_Q_substrate_normalized(self, N: int, num_points: int = 512) -> jnp.ndarray:
+        """Return the substrate half-space Q matrix.
+
+        Output:
+            A complex matrix with shape ``(4 * num_h, 4 * num_h)``, where
+            ``num_h = 2N + 1``. The basis is
+
+                [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
+
+            Since the substrate is uniform and isotropic, this matrix is
+            harmonic-decoupled even though it is stored in the full flattened
+            form.
+        """
         return self._build_uniform_medium_Q_normalized(
             self.eps_substrate,
             N,
@@ -119,91 +223,20 @@ class Stack:
         )
 
     def get_Q_superstrate_normalized(self, N: int, num_points: int = 512) -> jnp.ndarray:
+        """Return the superstrate half-space Q matrix.
+
+        Output:
+            A complex matrix with shape ``(4 * num_h, 4 * num_h)``, where
+            ``num_h = 2N + 1``. The basis is
+
+                [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
+
+            Since the superstrate is uniform and isotropic, this matrix is
+            harmonic-decoupled even though it is stored in the full flattened
+            form.
+        """
         return self._build_uniform_medium_Q_normalized(
             self.eps_superstrate,
             N,
             num_points=num_points,
         )
-
-    @staticmethod
-    def _isotropic_diag_blocks(Q_iso: jnp.ndarray) -> jnp.ndarray:
-        """Extract per-harmonic 4x4 isotropic blocks from either Q layout.
-
-        The original implementation used a tensor with shape
-        ``(num_h, num_h, 4, 4)`` and only the diagonal ``(h, h)`` blocks were
-        populated for isotropic media.
-
-        The rewritten code builds a full matrix with shape
-        ``(4 * num_h, 4 * num_h)`` in component-major ordering:
-
-            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)].
-
-        For a uniform isotropic medium this full matrix is still decoupled
-        harmonic-by-harmonic. Regrouping the component-major indices by
-        harmonic recovers the same independent 4x4 blocks.
-        """
-        if Q_iso.ndim == 4:
-            diag_blocks = jnp.diagonal(Q_iso, axis1=0, axis2=1)
-            return jnp.moveaxis(diag_blocks, -1, 0)
-
-        if Q_iso.ndim == 2:
-            if Q_iso.shape[0] != Q_iso.shape[1]:
-                raise ValueError(f"Expected a square Q matrix, got shape={Q_iso.shape}.")
-            if Q_iso.shape[0] % 4 != 0:
-                raise ValueError(
-                    "Expected a full isotropic Q matrix with size divisible by 4, "
-                    f"got shape={Q_iso.shape}."
-                )
-
-            num_h = Q_iso.shape[0] // 4
-
-            # Reshape the component-major matrix into explicit harmonic/component
-            # block indices:
-            #   Q[h_row, comp_row, h_col, comp_col].
-            q_blocks = Q_iso.reshape(4, num_h, 4, num_h).transpose(1, 0, 3, 2)
-            diag_blocks = jnp.diagonal(q_blocks, axis1=0, axis2=2)
-            return jnp.moveaxis(diag_blocks, -1, 0)
-
-        raise ValueError(
-            "Expected isotropic Q data with ndim 2 or 4, "
-            f"got ndim={Q_iso.ndim} and shape={Q_iso.shape}."
-        )
-
-    @staticmethod
-    @jax.jit
-    def diagonalize_sort_isotropic_modes(Q_iso: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Diagonalize isotropic half-space modes harmonic-by-harmonic.
-
-        Accepts either the original diagonal-block tensor layout or the rewritten
-        full matrix layout and reduces both to per-harmonic 4x4 blocks before
-        diagonalization.
-        """
-        diag_blocks = Stack._isotropic_diag_blocks(Q_iso)
-
-        def _resolve_pair(v1: jnp.ndarray, v2: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            w1 = v2[3] * v1 - v1[3] * v2
-            w1_norm = jnp.linalg.norm(w1)
-            w1 = jnp.where(w1_norm > 1e-14, w1 / w1_norm, v1)
-
-            w2 = v2[2] * v1 - v1[2] * v2
-            w2_norm = jnp.linalg.norm(w2)
-            w2 = jnp.where(w2_norm > 1e-14, w2 / w2_norm, v2)
-            return w1, w2
-
-        def _eig_sort_single(block: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            eigenvalues, eigenvectors = jnp.linalg.eig(block)
-            tol = 1e-8
-            im_rounded = jnp.round(jnp.imag(eigenvalues) / tol) * tol
-            re_rounded = jnp.round(jnp.real(eigenvalues) / tol) * tol
-            sort_idx = jnp.lexsort((-re_rounded, -im_rounded))
-            eigenvalues = eigenvalues[sort_idx]
-            eigenvectors = eigenvectors[:, sort_idx]
-
-            w1_fwd, w2_fwd = _resolve_pair(eigenvectors[:, 0], eigenvectors[:, 1])
-            w1_bwd, w2_bwd = _resolve_pair(eigenvectors[:, 2], eigenvectors[:, 3])
-            eigenvectors = jnp.column_stack([w1_fwd, w2_fwd, w1_bwd, w2_bwd])
-            return eigenvalues, eigenvectors
-
-        return jax.vmap(_eig_sort_single)(diag_blocks)
-    
-

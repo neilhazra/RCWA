@@ -21,6 +21,134 @@ class Solver:
         return jnp.eye(size, dtype=jnp.complex128)[src]
 
     @staticmethod
+    def _isotropic_diag_blocks(Q_iso: jnp.ndarray) -> jnp.ndarray:
+        """Extract per-harmonic 4x4 isotropic blocks from either Q layout.
+
+        Accepted input layouts:
+            1. Old tensor layout with shape ``(num_h, num_h, 4, 4)``.
+               Only the diagonal ``(h, h)`` blocks are nonzero for isotropic
+               media, and each diagonal entry is a 4x4 matrix for one harmonic.
+
+            2. New flattened full-matrix layout with shape
+               ``(4 * num_h, 4 * num_h)`` in the component-major ordering
+
+                   [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
+
+               In this representation, the field components are grouped first
+               and the harmonic index varies inside each group.
+
+        Output:
+            A tensor with shape ``(num_h, 4, 4)``.
+
+            Entry ``output[h]`` is the 4x4 matrix acting on the four reduced
+            field components of harmonic ``h`` alone. The harmonic ordering is
+            the same as everywhere else in the code:
+
+                h = 0, 1, ..., num_h - 1  corresponds to  n = -N, ..., N.
+
+        For a uniform isotropic medium the full matrix is decoupled
+        harmonic-by-harmonic, so regrouping the component-major indices by
+        harmonic recovers these same independent 4x4 blocks.
+        """
+        if Q_iso.ndim == 4:
+            diag_blocks = jnp.diagonal(Q_iso, axis1=0, axis2=1)
+            return jnp.moveaxis(diag_blocks, -1, 0)
+
+        if Q_iso.ndim == 2:
+            if Q_iso.shape[0] != Q_iso.shape[1]:
+                raise ValueError(f"Expected a square Q matrix, got shape={Q_iso.shape}.")
+            if Q_iso.shape[0] % 4 != 0:
+                raise ValueError(
+                    "Expected a full isotropic Q matrix with size divisible by 4, "
+                    f"got shape={Q_iso.shape}."
+                )
+
+            num_h = Q_iso.shape[0] // 4
+
+            # Reshape the component-major matrix into explicit harmonic/component
+            # block indices:
+            #   Q[h_row, comp_row, h_col, comp_col].
+            q_blocks = Q_iso.reshape(4, num_h, 4, num_h).transpose(1, 0, 3, 2)
+            diag_blocks = jnp.diagonal(q_blocks, axis1=0, axis2=2)
+            return jnp.moveaxis(diag_blocks, -1, 0)
+
+        raise ValueError(
+            "Expected isotropic Q data with ndim 2 or 4, "
+            f"got ndim={Q_iso.ndim} and shape={Q_iso.shape}."
+        )
+
+    @staticmethod
+    @jax.jit
+    def diagonalize_sort_isotropic_modes(Q_iso: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Diagonalize isotropic half-space modes harmonic-by-harmonic.
+
+        Input:
+            ``Q_iso`` may be either
+            - the old tensor layout with shape ``(num_h, num_h, 4, 4)``, or
+            - the new flattened layout with shape ``(4 * num_h, 4 * num_h)``.
+
+            In both cases the matrix describes a uniform isotropic half-space.
+
+        Internal reduction:
+            The input is first converted into a tensor of shape
+            ``(num_h, 4, 4)``, where each 4x4 block is the single-harmonic
+            isotropic operator for one diffraction order.
+
+        Output:
+            ``(eigenvalues, eigenvectors)`` where
+            - ``eigenvalues`` has shape ``(num_h, 4)``
+            - ``eigenvectors`` has shape ``(num_h, 4, 4)``
+
+            ``eigenvalues[h, :]`` are the four modal eigenvalues for harmonic
+            ``h``.
+
+            ``eigenvectors[h, :, :]`` is a 4x4 matrix whose columns are the
+            corresponding modal field vectors in the single-harmonic basis
+
+                [-H_y, H_x, E_y, D_x]^T
+
+            for that harmonic.
+
+        Sorting convention:
+            Inside each 4x4 block, the modes are sorted into
+            ``[forward_1, forward_2, backward_1, backward_2]`` using the same
+            eigenvalue-based ordering logic as the previous implementation.
+        """
+        diag_blocks = Stack._isotropic_diag_blocks(Q_iso)
+
+        def _resolve_pair(v1: jnp.ndarray, v2: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+            # Each input vector has shape (4,) and lives in the single-harmonic
+            # field basis [-H_y, H_x, E_y, D_x]^T. This helper recombines a
+            # nearly degenerate pair into a more stable polarization basis.
+            w1 = v2[3] * v1 - v1[3] * v2
+            w1_norm = jnp.linalg.norm(w1)
+            w1 = jnp.where(w1_norm > 1e-14, w1 / w1_norm, v1)
+
+            w2 = v2[2] * v1 - v1[2] * v2
+            w2_norm = jnp.linalg.norm(w2)
+            w2 = jnp.where(w2_norm > 1e-14, w2 / w2_norm, v2)
+            return w1, w2
+
+        def _eig_sort_single(block: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+            # `block` has shape (4, 4) and is the isotropic operator for one
+            # harmonic order only.
+            eigenvalues, eigenvectors = jnp.linalg.eig(block)
+            tol = 1e-8
+            im_rounded = jnp.round(jnp.imag(eigenvalues) / tol) * tol
+            re_rounded = jnp.round(jnp.real(eigenvalues) / tol) * tol
+            sort_idx = jnp.lexsort((-re_rounded, -im_rounded))
+            eigenvalues = eigenvalues[sort_idx]
+            eigenvectors = eigenvectors[:, sort_idx]
+
+            w1_fwd, w2_fwd = _resolve_pair(eigenvectors[:, 0], eigenvectors[:, 1])
+            w1_bwd, w2_bwd = _resolve_pair(eigenvectors[:, 2], eigenvectors[:, 3])
+            eigenvectors = jnp.column_stack([w1_fwd, w2_fwd, w1_bwd, w2_bwd])
+            return eigenvalues, eigenvectors
+
+        return jax.vmap(_eig_sort_single)(diag_blocks)
+    
+
+    @staticmethod
     def modes_to_fields_matrix(evecs: jnp.ndarray) -> jnp.ndarray:
         """Assemble a block-diagonal modes-to-fields matrix across harmonics."""
         return jax.scipy.linalg.block_diag(*evecs)
