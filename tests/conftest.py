@@ -1,10 +1,37 @@
 from __future__ import annotations
 
+import pathlib
+import sys
+
 import numpy as np
 import pytest
 import jax.numpy as jnp
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 from rcwa import Layer, Stack
+
+
+@pytest.fixture
+def uniform_interface_stack() -> Stack:
+    period_nm = 500.0
+    n_sub = 1.4696
+    n_sup = 1.0
+
+    stack = Stack(
+        wavelength_nm=405.0,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_sub**2,
+        eps_superstrate=n_sup**2,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm=0.0,
+            eps_tensor=n_sub**2 * jnp.eye(3, dtype=jnp.complex128),
+            x_domain_nm=(0.0, period_nm),
+        )
+    )
+    return stack
 
 
 @pytest.fixture

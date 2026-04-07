@@ -1,8 +1,23 @@
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
+import pytest
 
-from rcwa import Layer
+from rcwa import Layer, Solver, Stack
+
+
+def test_layer_eps_folds_periodically() -> None:
+    layer = Layer.piecewise(
+        thickness_nm=10.0,
+        x_domain_nm=(0.0, 100.0),
+        segments=[
+            (0.0, 40.0, 2.0 * jnp.eye(3)),
+            (40.0, 100.0, 3.0 * jnp.eye(3)),
+        ],
+    )
+    x = jnp.array([5.0, 25.0, 75.0])
+    assert jnp.allclose(layer.eps(x), layer.eps(x + layer.period_nm))
 
 
 def test_uniform_layer_toeplitz_matrices_are_diagonal_with_constant_entry() -> None:
@@ -69,11 +84,38 @@ def test_toeplitz_matrices_match_manual_harmonic_difference_indexing() -> None:
 
     for key, coeff_array in coeffs.items():
         expected = jnp.array(
-            [
-                [coeff_array[int(n - m + 2 * N)] for m in orders]
-                for n in orders
-            ],
+            [[coeff_array[int(n - m + 2 * N)] for m in orders] for n in orders],
             dtype=jnp.complex128,
         )
         assert toeplitz[key].shape == (2 * N + 1, 2 * N + 1)
         assert jnp.allclose(toeplitz[key], expected, atol=1e-12)
+
+
+def test_stack_rejects_mismatched_periods() -> None:
+    stack = Stack(wavelength_nm=405.0, kappa_inv_nm=0.0, eps_substrate=1.0, eps_superstrate=1.0)
+    stack.add_layer(Layer.uniform(10.0, 2.0 * jnp.eye(3), x_domain_nm=(0.0, 100.0)))
+
+    with pytest.raises(ValueError, match="does not match stack period"):
+        stack.add_layer(Layer.uniform(10.0, 2.0 * jnp.eye(3), x_domain_nm=(0.0, 120.0)))
+
+
+def test_stack_normalized_parameters_follow_geometry(uniform_interface_stack: Stack) -> None:
+    stack = uniform_interface_stack
+    assert jnp.isclose(stack.period_nm, 500.0)
+    assert jnp.isclose(stack.G_normalized, stack.wavelength_nm / stack.period_nm)
+    assert jnp.isclose(stack.kappa_normalized, 0.0)
+    assert jnp.isclose(stack.thickness_normalized(0), 0.0)
+
+
+def test_uniform_q_matrix_reorders_to_harmonic_block_diagonal_form(
+    uniform_interface_stack: Stack,
+) -> None:
+    N = 2
+    reorder = Solver.reorder_matrix(N)
+    Q_component_major = uniform_interface_stack.get_Q_substrate_normalized(N)
+    Q_harmonic_major = reorder @ Q_component_major @ reorder.T
+    diag_blocks = Solver._isotropic_diag_blocks(Q_component_major)
+    expected = jax.scipy.linalg.block_diag(*diag_blocks)
+
+    assert Q_component_major.shape == (4 * Stack.num_harmonics(N), 4 * Stack.num_harmonics(N))
+    assert jnp.allclose(Q_harmonic_major, expected, atol=1e-12)
