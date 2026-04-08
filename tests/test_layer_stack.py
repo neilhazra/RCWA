@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
+import numpy as jnp
 import pytest
+import scipy.linalg
 
 from rcwa import Layer, Solver, Stack
 
@@ -173,7 +173,7 @@ def test_uniform_q_matrix_reorders_to_harmonic_block_diagonal_form(
     Q_component_major = uniform_interface_stack.get_Q_substrate_normalized(N)
     Q_harmonic_major = reorder @ Q_component_major @ reorder.T
     diag_blocks = Solver._isotropic_diag_blocks(Q_component_major)
-    expected = jax.scipy.linalg.block_diag(*diag_blocks)
+    expected = scipy.linalg.block_diag(*diag_blocks)
 
     assert Q_component_major.shape == (4 * Stack.num_harmonics(N), 4 * Stack.num_harmonics(N))
     assert jnp.allclose(Q_harmonic_major, expected, atol=1e-12)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
+import numpy as jnp
+import scipy.linalg
 
 from . import _config  # noqa: F401
 from .stack import Stack
@@ -87,8 +87,6 @@ class Solver:
         safe_norms = jnp.where(norms > tol, norms, 1.0)
         return vectors / safe_norms
 
-    @staticmethod
-    @jax.jit
     def diagonalize_sort_isotropic_modes(Q_iso: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Diagonalize isotropic half-space modes harmonic-by-harmonic.
 
@@ -136,7 +134,10 @@ class Solver:
             eigenvectors = jnp.column_stack([te_fwd, tm_fwd, te_bwd, tm_bwd])
             return eigenvalues, Solver._normalize_columns(eigenvectors)
 
-        return jax.vmap(_eig_sort_single)(diag_blocks)
+        mode_data = [_eig_sort_single(block) for block in diag_blocks]
+        eigenvalues = jnp.stack([vals for vals, _ in mode_data], axis=0)
+        eigenvectors = jnp.stack([vecs for _, vecs in mode_data], axis=0)
+        return eigenvalues, eigenvectors
 
     @staticmethod
     def modes_to_fields_matrix(evecs: jnp.ndarray) -> jnp.ndarray:
@@ -156,7 +157,7 @@ class Solver:
 
         num_h = int(evecs.shape[0])
         N = (num_h - 1) // 2
-        fields = jax.scipy.linalg.block_diag(*evecs)
+        fields = scipy.linalg.block_diag(*evecs)
         return fields[:, Solver.mode_reorder_indices(N)]
 
     @staticmethod
@@ -388,6 +389,6 @@ class Solver:
         half = 2 * Stack.num_harmonics(N)
 
         inc = jnp.zeros(half, dtype=jnp.complex128)
-        inc = inc.at[Solver.zero_order_mode_index(N, incident_pol)].set(1.0)
+        inc[Solver.zero_order_mode_index(N, incident_pol)] = 1.0
 
         return S11 @ inc, S21 @ inc

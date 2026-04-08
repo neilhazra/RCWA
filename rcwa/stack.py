@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import jax
-import jax.numpy as jnp
+import numpy as jnp
 
 from . import _config  # noqa: F401
 from .layer import Layer

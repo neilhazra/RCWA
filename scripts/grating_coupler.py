@@ -12,8 +12,7 @@ than the infinite-periodic case to converge quantitatively.
 
 from __future__ import annotations
 
-import jax.numpy as jnp
-
+import numpy as jnp
 from rcwa import Layer, Stack
 from rcwa.solver import Solver
 

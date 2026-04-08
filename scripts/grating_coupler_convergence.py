@@ -1,6 +1,6 @@
 """Grating coupler convergence study."""
 
-import jax.numpy as jnp
+import numpy as jnp
 
 from rcwa import Layer, Stack
 from rcwa.solver import Solver

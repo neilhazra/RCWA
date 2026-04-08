@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Callable
 
-import jax
-import jax.numpy as jnp
+import numpy as jnp
 
 from . import _config  # noqa: F401
 
@@ -220,9 +218,6 @@ class Layer:
         kx_values = kappa_normalized + harmonic_orders * G_normalized
         return jnp.diag(kx_values.astype(jnp.complex128))
 
-
-    @staticmethod
-    @partial(jax.jit, static_argnames=("N",))
     def build_Q_matrix_normalized(
         n_vals: jnp.ndarray,
         m_vals: jnp.ndarray,

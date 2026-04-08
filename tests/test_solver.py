@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
+import numpy as jnp
 import pytest
+import scipy.linalg
 
 from rcwa import Layer, Solver, Stack
 
@@ -236,7 +236,7 @@ def test_isotropic_mode_fields_have_global_forward_backward_split(
 def test_modes_to_fields_matrix_reorders_columns_into_solver_modal_layout() -> None:
     evecs = jnp.arange(3 * 4 * 4, dtype=jnp.complex128).reshape(3, 4, 4)
     fields = Solver.modes_to_fields_matrix(evecs)
-    block = jax.scipy.linalg.block_diag(*evecs)
+    block = scipy.linalg.block_diag(*evecs)
     expected = block[:, Solver.mode_reorder_indices(1)]
     assert jnp.array_equal(fields, expected)
 
@@ -429,7 +429,8 @@ def test_reflection_transmission_only_populates_zero_order_for_uniform_interface
                 num_points=256,
             )
             zero_mode = Solver.zero_order_mode_index(N, pol)
-            mask = jnp.ones_like(r, dtype=bool).at[zero_mode].set(False)
+            mask = jnp.ones_like(r, dtype=bool)
+            mask[zero_mode] = False
 
             assert jnp.allclose(r[mask], 0, atol=1e-10)
             assert jnp.allclose(t[mask], 0, atol=1e-10)
