@@ -131,7 +131,7 @@ class Solver:
             )
 
         def _eig_sort_single(block: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            eigenvalues, eigenvectors = jnp.linalg.eig(block)
+            eigenvalues, eigenvectors = scipy.linalg.eig(block)
             tol = 1e-8
             direction_metric = jnp.where(
                 jnp.abs(jnp.imag(eigenvalues)) > tol,
@@ -183,7 +183,7 @@ class Solver:
         tol: float = 1e-9,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Diagonalize a full layer Q matrix and sort it into [forward, backward] modes."""
-        eigenvalues, eigenvectors = jnp.linalg.eig(Q)
+        eigenvalues, eigenvectors = scipy.linalg.eig(Q)
         eigenvectors = Solver._normalize_columns(eigenvectors)
         half = Q.shape[0] // 2
         eigvals = [complex(v) for v in eigenvalues]

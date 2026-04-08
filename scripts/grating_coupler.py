@@ -28,7 +28,12 @@ duty_cycle = 0.5
 design_wl_nm = 633.0
 sweep_half_span_nm = 40.0
 sweep_num_samples = 81
-geometry_fourier_order = 2048
+geometry_fourier_order = 256
+default_geometry_num_points = 8192
+default_num_points = 1024
+default_design_N = 16
+default_sweep_N = 12
+max_reasonable_dense_N = 96
 
 
 def _merge_adjacent_segments(
@@ -168,6 +173,54 @@ def get_zero_order_field_rt(
     return r0, t0
 
 
+def _validate_dense_truncation(N: int) -> None:
+    if N > max_reasonable_dense_N:
+        matrix_size = 4 * Stack.num_harmonics(N)
+        raise ValueError(
+            f"N={N} implies dense layer matrices of size {matrix_size}x{matrix_size}, "
+            "which is not a reasonable default for this dense RCWA script. "
+            f"Use N <= {max_reasonable_dense_N} unless you are deliberately running a very large solve."
+        )
+
+
+def solve_zero_order_field_rt(
+    stack: Stack,
+    N: int,
+    num_points: int = default_num_points,
+) -> dict[str, tuple[complex, complex]]:
+    _validate_dense_truncation(N)
+
+    S11, _, S21, _ = Solver.total_scattering_matrix(stack, N, num_points=num_points)
+    half = 2 * Stack.num_harmonics(N)
+    Q_sub = stack.get_Q_substrate_normalized(N, num_points=num_points)
+    Q_sup = stack.get_Q_superstrate_normalized(N, num_points=num_points)
+    _, evecs_sub = Solver.diagonalize_sort_isotropic_modes(Q_sub)
+    _, evecs_sup = Solver.diagonalize_sort_isotropic_modes(Q_sup)
+    h = Stack.zero_harmonic_index(N)
+
+    results: dict[str, tuple[complex, complex]] = {}
+    for pol, sub_cols, sup_col in [
+        ("TE", (2, 0, 2), 2),
+        ("TM", (3, 1, 3), 3),
+    ]:
+        inc = jnp.zeros(half, dtype=jnp.complex128)
+        zero_mode = Solver.zero_order_mode_index(N, pol)
+        inc[zero_mode] = 1.0
+        reflected = S11 @ inc
+        transmitted = S21 @ inc
+
+        field_row, fwd_col, bwd_col = sub_cols
+        E_sub_fwd = evecs_sub[h, field_row, fwd_col]
+        E_sub_bwd = evecs_sub[h, field_row, bwd_col]
+        E_sup_fwd = evecs_sup[h, field_row, fwd_col]
+
+        r0 = reflected[zero_mode] * (E_sub_bwd / E_sub_fwd)
+        t0 = transmitted[zero_mode] * (E_sup_fwd / E_sub_fwd)
+        results[pol] = (r0, t0)
+
+    return results
+
+
 def transmission_power_scale(pol: str) -> float:
     pol = pol.upper()
     if pol == "TE":
@@ -181,7 +234,7 @@ def get_zero_order_power_rt(
     stack: Stack,
     N: int,
     pol: str = "TE",
-    num_points: int = 4096,
+    num_points: int = default_num_points,
 ) -> tuple[float, float]:
     r0, t0 = get_zero_order_field_rt(stack, N=N, pol=pol, num_points=num_points)
     R0 = jnp.abs(r0) ** 2
@@ -189,30 +242,55 @@ def get_zero_order_power_rt(
     return R0, T0
 
 
+def sweep_wavelength_response_all_pols(
+    wavelengths_nm: jnp.ndarray,
+    N: int,
+    num_points: int = default_num_points,
+) -> dict[str, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
+    _validate_dense_truncation(N)
+    traces = {
+        "TE": {"R": [], "T": [], "residual": []},
+        "TM": {"R": [], "T": [], "residual": []},
+    }
+
+    for wavelength_nm in wavelengths_nm:
+        stack = make_stack(float(wavelength_nm))
+        rt_fields = solve_zero_order_field_rt(stack, N=N, num_points=num_points)
+        for pol in ["TE", "TM"]:
+            r0, t0 = rt_fields[pol]
+            R0 = jnp.abs(r0) ** 2
+            T0 = jnp.abs(t0) ** 2 * transmission_power_scale(pol)
+            nonzero_order_power = jnp.maximum(0.0, 1.0 - R0 - T0)
+
+            traces[pol]["R"].append(float(R0))
+            traces[pol]["T"].append(float(T0))
+            traces[pol]["residual"].append(float(nonzero_order_power))
+
+    return {
+        pol: (
+            jnp.array(pol_traces["R"]),
+            jnp.array(pol_traces["T"]),
+            jnp.array(pol_traces["residual"]),
+        )
+        for pol, pol_traces in traces.items()
+    }
+
+
 def sweep_wavelength_response(
     wavelengths_nm: jnp.ndarray,
     N: int,
     pol: str = "TE",
-    num_points: int = 4096,
+    num_points: int = default_num_points,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    reflected = []
-    transmitted = []
-    residual = []
-
-    for wavelength_nm in wavelengths_nm:
-        stack = make_stack(float(wavelength_nm))
-        R0, T0 = get_zero_order_power_rt(stack, N=N, pol=pol, num_points=num_points)
-        nonzero_order_power = jnp.maximum(0.0, 1.0 - R0 - T0)
-
-        reflected.append(float(R0))
-        transmitted.append(float(T0))
-        residual.append(float(nonzero_order_power))
-
-    return jnp.array(reflected), jnp.array(transmitted), jnp.array(residual)
+    return sweep_wavelength_response_all_pols(
+        wavelengths_nm,
+        N=N,
+        num_points=num_points,
+    )[pol.upper()]
 
 
 def sample_grating_profile(
-    num_points: int = 4096*8,
+    num_points: int = default_geometry_num_points,
     fourier_order: int = geometry_fourier_order,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     stack = make_stack(design_wl_nm)
@@ -229,7 +307,7 @@ def sample_grating_profile(
 
 
 def plot_geometry(
-    num_points: int = 4096,
+    num_points: int = default_geometry_num_points,
     fourier_order: int = geometry_fourier_order,
 ) -> None:
     import matplotlib.pyplot as plt
@@ -249,7 +327,7 @@ def plot_geometry(
         color="tab:red",
         lw=1.2,
         linestyle="--",
-        label=f"Lanczos sigma Fourier reconstruction (|n| <= {fourier_order})",
+        label=f"Fourier reconstruction (|n| <= {fourier_order})",
     )
     ax.axvspan(
         grating_start_nm / 1000.0,
@@ -270,7 +348,11 @@ def plot_geometry(
     fig.tight_layout()
 
 
-def run_design_point_demo(N: int = 2048, num_points: int = 4096*16) -> None:
+def run_design_point_demo(
+    N: int = default_design_N,
+    num_points: int = default_num_points,
+) -> None:
+    _validate_dense_truncation(N)
     stack = make_stack(design_wl_nm)
     print(
         "Finite supercell grating coupler\n"
@@ -283,8 +365,7 @@ def run_design_point_demo(N: int = 2048, num_points: int = 4096*16) -> None:
         "R/T does not represent the full coupling budget."
     )
 
-    for pol in ["TE", "TM"]:
-        r0, t0 = get_zero_order_field_rt(stack, N=N, pol=pol, num_points=num_points)
+    for pol, (r0, t0) in solve_zero_order_field_rt(stack, N=N, num_points=num_points).items():
         print(
             f"{pol}: r0 = {complex(r0):.6g}, t0 = {complex(t0):.6g}, "
             f"|r0|^2 = {float(jnp.abs(r0) ** 2):.6f}, |t0|^2 = {float(jnp.abs(t0) ** 2):.6f}"
@@ -295,10 +376,11 @@ def plot_wavelength_sweep(
     center_wavelength_nm: float = design_wl_nm,
     half_span_nm: float = sweep_half_span_nm,
     num_samples: int = sweep_num_samples,
-    N: int = 102,
-    num_points: int = 4096,
+    N: int = default_sweep_N,
+    num_points: int = default_num_points,
 ) -> None:
     import matplotlib.pyplot as plt
+    _validate_dense_truncation(N)
 
     wavelengths_nm = jnp.linspace(
         center_wavelength_nm - half_span_nm,
@@ -306,14 +388,14 @@ def plot_wavelength_sweep(
         num_samples,
     )
     fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+    traces = sweep_wavelength_response_all_pols(
+        wavelengths_nm,
+        N=N,
+        num_points=num_points,
+    )
 
     for ax, pol in zip(axes, ["TE", "TM"]):
-        reflected, transmitted, residual = sweep_wavelength_response(
-            wavelengths_nm,
-            N=N,
-            pol=pol,
-            num_points=num_points,
-        )
+        reflected, transmitted, residual = traces[pol]
         peak_index = int(jnp.argmax(residual))
         peak_wavelength_nm = float(wavelengths_nm[peak_index])
         peak_residual = float(residual[peak_index])
