@@ -28,6 +28,11 @@ class Stack:
     kappa_inv_nm: float = 0.0
     eps_substrate: complex = 1.0
     eps_superstrate: complex = 1.0
+    _uniform_q_cache: dict[tuple[complex, int, int], jnp.ndarray] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def period_nm(self) -> float:
@@ -64,6 +69,7 @@ class Stack:
                 f"Layer period {layer.period_nm} nm does not match stack period {self.period_nm} nm"
             )
         self.layers.append(layer)
+        self._uniform_q_cache.clear()
 
     def layer_Q_matrix_normalized(
         self, layer_index: int, N: int, num_points: int = 512
@@ -183,24 +189,27 @@ class Stack:
             harmonic-by-harmonic. After regrouping rows and columns by
             harmonic, it consists of ``num_h`` independent 4x4 blocks.
         """
-        x_domain_nm = self.layers[0].x_domain_nm if self.layers else (0.0, 1.0)
-        uniform_layer = Layer.uniform(
-            thickness_nm=0.0,
-            eps_tensor=jnp.asarray(eps, dtype=jnp.complex128) * jnp.eye(3, dtype=jnp.complex128),
-            x_domain_nm=x_domain_nm,
-        )
-        toeplitz_matrices = uniform_layer.build_toeplitz_fourier_matrices(
-            N,
-            num_points=num_points,
-        )
-        return Layer.build_Q_matrix_normalized(
-            self.harmonic_orders(N),
-            self.harmonic_orders(N),
-            self.kappa_normalized,
-            self.G_normalized,
-            toeplitz_matrices,
-            N,
-        )
+        cache_key = (complex(eps), N, num_points)
+        if cache_key not in self._uniform_q_cache:
+            x_domain_nm = self.layers[0].x_domain_nm if self.layers else (0.0, 1.0)
+            uniform_layer = Layer.uniform(
+                thickness_nm=0.0,
+                eps_tensor=jnp.asarray(eps, dtype=jnp.complex128) * jnp.eye(3, dtype=jnp.complex128),
+                x_domain_nm=x_domain_nm,
+            )
+            toeplitz_matrices = uniform_layer.build_toeplitz_fourier_matrices(
+                N,
+                num_points=num_points,
+            )
+            self._uniform_q_cache[cache_key] = Layer.build_Q_matrix_normalized(
+                self.harmonic_orders(N),
+                self.harmonic_orders(N),
+                self.kappa_normalized,
+                self.G_normalized,
+                toeplitz_matrices,
+                N,
+            )
+        return self._uniform_q_cache[cache_key]
 
     def get_Q_substrate_normalized(self, N: int, num_points: int = 512) -> jnp.ndarray:
         """Return the substrate half-space Q matrix.

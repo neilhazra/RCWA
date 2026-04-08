@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as jnp
@@ -20,6 +20,17 @@ class Layer:
     thickness_nm: float
     x_domain_nm: tuple[float, float]
     eps_fn: DielectricTensorFn
+    _field_quantities_cache: dict[int, FieldQuantities] = field(default_factory=dict, init=False, repr=False)
+    _fourier_coefficients_cache: dict[tuple[int, int], FourierCoefficients] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _toeplitz_cache: dict[tuple[int, int], dict[str, jnp.ndarray]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def period_nm(self) -> float:
@@ -135,7 +146,11 @@ class Layer:
 
     def field_quantities(self, num_points: int = 512) -> FieldQuantities:
         """Sample and convert the dielectric tensor into the RCWA field quantities."""
-        return self._field_quantities_from_eps(self.sample_eps(num_points))
+        if num_points not in self._field_quantities_cache:
+            self._field_quantities_cache[num_points] = self._field_quantities_from_eps(
+                self.sample_eps(num_points)
+            )
+        return self._field_quantities_cache[num_points]
 
     @staticmethod
     def _fft_centered_coefficients(values: jnp.ndarray, N: int) -> jnp.ndarray:
@@ -148,11 +163,14 @@ class Layer:
 
     def fourier_coefficients(self, N: int, num_points: int = 512) -> FourierCoefficients:
         """Compute Fourier coefficients of the RCWA field quantities used by Q."""
-        quantities = self.field_quantities(num_points=num_points)
-        return {
-            key: self._fft_centered_coefficients(values, N)
-            for key, values in quantities.items()
-        }
+        cache_key = (N, num_points)
+        if cache_key not in self._fourier_coefficients_cache:
+            quantities = self.field_quantities(num_points=num_points)
+            self._fourier_coefficients_cache[cache_key] = {
+                key: self._fft_centered_coefficients(values, N)
+                for key, values in quantities.items()
+            }
+        return self._fourier_coefficients_cache[cache_key]
 
     @staticmethod
     def uniform(
@@ -189,23 +207,20 @@ class Layer:
 
     def build_toeplitz_fourier_matrices(self, N: int, num_points: int = 512) -> dict[str, jnp.ndarray]:
         """Build one Toeplitz Fourier-convolution matrix per field quantity."""
-        fourier_coeffs = self.fourier_coefficients(N, num_points=num_points)
-        harmonic_orders = jnp.arange(-N, N + 1)
+        cache_key = (N, num_points)
+        if cache_key not in self._toeplitz_cache:
+            fourier_coeffs = self.fourier_coefficients(N, num_points=num_points)
+            harmonic_orders = jnp.arange(-N, N + 1)
 
-        # The Toeplitz entry at row n and column m is the Fourier coefficient
-        # with harmonic difference (n - m). Because `fourier_coefficients`
-        # returns coefficients ordered from -2N to 2N, we shift by +2N to turn
-        # the harmonic difference into a valid array index.
-        difference_indices = (
-            harmonic_orders[:, None] - harmonic_orders[None, :] + 2 * N
-        ).astype(jnp.int32)
+            difference_indices = (
+                harmonic_orders[:, None] - harmonic_orders[None, :] + 2 * N
+            ).astype(jnp.int32)
 
-        # Build a separate (2N + 1) x (2N + 1) Toeplitz matrix for every
-        # sampled field quantity in the dictionary.
-        return {
-            key: coeffs[difference_indices]
-            for key, coeffs in fourier_coeffs.items()
-        }
+            self._toeplitz_cache[cache_key] = {
+                key: coeffs[difference_indices]
+                for key, coeffs in fourier_coeffs.items()
+            }
+        return self._toeplitz_cache[cache_key]
 
     @staticmethod
     def build_K_x_diag_matrix(

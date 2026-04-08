@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as jnp
 import scipy.linalg
 
@@ -14,6 +16,7 @@ class Solver:
     """Modal RCWA solver using adjacent-port scattering matrices."""
 
     @staticmethod
+    @lru_cache(maxsize=None)
     def reorder_matrix(N: int) -> jnp.ndarray:
         """Map component-major field ordering into harmonic-major ordering."""
         num_h = Stack.num_harmonics(N)
@@ -22,6 +25,7 @@ class Solver:
         return jnp.eye(size, dtype=jnp.complex128)[src]
 
     @staticmethod
+    @lru_cache(maxsize=None)
     def mode_reorder_indices(N: int) -> jnp.ndarray:
         """Return the global modal column order [fwd, bwd] from per-harmonic blocks.
 
@@ -44,6 +48,15 @@ class Solver:
             + [4 * h + 3 for h in range(num_h)],
             dtype=jnp.int32,
         )
+
+    @staticmethod
+    def component_to_harmonic_major(matrix: jnp.ndarray) -> jnp.ndarray:
+        """Reorder a full 4*num_h square matrix from component-major to harmonic-major."""
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or matrix.shape[0] % 4 != 0:
+            raise ValueError(f"Expected a square matrix with size divisible by 4, got {matrix.shape}.")
+
+        num_h = matrix.shape[0] // 4
+        return matrix.reshape(4, num_h, 4, num_h).transpose(1, 0, 3, 2).reshape(matrix.shape)
 
     @staticmethod
     def zero_order_mode_index(N: int, incident_pol: str) -> int:
@@ -157,7 +170,10 @@ class Solver:
 
         num_h = int(evecs.shape[0])
         N = (num_h - 1) // 2
-        fields = scipy.linalg.block_diag(*evecs)
+        size = 4 * num_h
+        fields = jnp.zeros((size, size), dtype=evecs.dtype)
+        for h in range(num_h):
+            fields[4 * h : 4 * (h + 1), 4 * h : 4 * (h + 1)] = evecs[h]
         return fields[:, Solver.mode_reorder_indices(N)]
 
     @staticmethod
@@ -336,9 +352,10 @@ class Solver:
     @staticmethod
     def total_scattering_matrix(stack: Stack, N: int, num_points: int = 512) -> ScatteringMatrix:
         """Return the stack S-matrix in substrate/superstrate modal bases."""
-        reorder = Solver.reorder_matrix(N)
         q_matrices = stack.build_all_Q_matrices_normalized(N, num_points=num_points)
-        q_matrices_harmonic_major = [reorder @ q @ reorder.T for q in q_matrices]
+        q_matrices_harmonic_major = [
+            Solver.component_to_harmonic_major(q_matrix) for q_matrix in q_matrices
+        ]
 
         substrate_fields = Solver.isotropic_mode_fields(
             stack.get_Q_substrate_normalized(N, num_points=num_points),
