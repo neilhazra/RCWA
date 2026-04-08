@@ -137,7 +137,7 @@ class Solver:
             )
 
         def _eig_sort_single(block: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            eigenvalues, eigenvectors = scipy.linalg.eig(block)
+            eigenvalues, eigenvectors = jnp.linalg.eig(block)
             tol = 1e-8
             direction_metric = jnp.where(
                 jnp.abs(jnp.imag(eigenvalues)) > tol,

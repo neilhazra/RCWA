@@ -33,7 +33,6 @@ default_geometry_num_points = 8192
 default_num_points = 1024
 default_design_N = 16
 default_sweep_N = 12
-max_reasonable_dense_N = 96
 
 
 def _merge_adjacent_segments(
@@ -173,24 +172,18 @@ def get_zero_order_field_rt(
     return r0, t0
 
 
-def _validate_dense_truncation(N: int) -> None:
-    if N > max_reasonable_dense_N:
-        matrix_size = 4 * Stack.num_harmonics(N)
-        raise ValueError(
-            f"N={N} implies dense layer matrices of size {matrix_size}x{matrix_size}, "
-            "which is not a reasonable default for this dense RCWA script. "
-            f"Use N <= {max_reasonable_dense_N} unless you are deliberately running a very large solve."
-        )
-
-
 def solve_zero_order_field_rt(
     stack: Stack,
     N: int,
     num_points: int = default_num_points,
+    verbose: bool = False,
 ) -> dict[str, tuple[complex, complex]]:
-    _validate_dense_truncation(N)
-
-    S11, _, S21, _ = Solver.total_scattering_matrix(stack, N, num_points=num_points)
+    S11, _, S21, _ = Solver.total_scattering_matrix(
+        stack,
+        N,
+        num_points=num_points,
+        verbose=verbose,
+    )
     half = 2 * Stack.num_harmonics(N)
     Q_sub = stack.get_Q_substrate_normalized(N, num_points=num_points)
     Q_sup = stack.get_Q_superstrate_normalized(N, num_points=num_points)
@@ -246,8 +239,8 @@ def sweep_wavelength_response_all_pols(
     wavelengths_nm: jnp.ndarray,
     N: int,
     num_points: int = default_num_points,
+    verbose: bool = False,
 ) -> dict[str, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-    _validate_dense_truncation(N)
     traces = {
         "TE": {"R": [], "T": [], "residual": []},
         "TM": {"R": [], "T": [], "residual": []},
@@ -255,7 +248,12 @@ def sweep_wavelength_response_all_pols(
 
     for wavelength_nm in wavelengths_nm:
         stack = make_stack(float(wavelength_nm))
-        rt_fields = solve_zero_order_field_rt(stack, N=N, num_points=num_points)
+        rt_fields = solve_zero_order_field_rt(
+            stack,
+            N=N,
+            num_points=num_points,
+            verbose=verbose,
+        )
         for pol in ["TE", "TM"]:
             r0, t0 = rt_fields[pol]
             R0 = jnp.abs(r0) ** 2
@@ -281,11 +279,13 @@ def sweep_wavelength_response(
     N: int,
     pol: str = "TE",
     num_points: int = default_num_points,
+    verbose: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     return sweep_wavelength_response_all_pols(
         wavelengths_nm,
         N=N,
         num_points=num_points,
+        verbose=verbose,
     )[pol.upper()]
 
 
@@ -351,8 +351,8 @@ def plot_geometry(
 def run_design_point_demo(
     N: int = default_design_N,
     num_points: int = default_num_points,
+    verbose: bool = False,
 ) -> None:
-    _validate_dense_truncation(N)
     stack = make_stack(design_wl_nm)
     print(
         "Finite supercell grating coupler\n"
@@ -365,7 +365,12 @@ def run_design_point_demo(
         "R/T does not represent the full coupling budget."
     )
 
-    for pol, (r0, t0) in solve_zero_order_field_rt(stack, N=N, num_points=num_points).items():
+    for pol, (r0, t0) in solve_zero_order_field_rt(
+        stack,
+        N=N,
+        num_points=num_points,
+        verbose=verbose,
+    ).items():
         print(
             f"{pol}: r0 = {complex(r0):.6g}, t0 = {complex(t0):.6g}, "
             f"|r0|^2 = {float(jnp.abs(r0) ** 2):.6f}, |t0|^2 = {float(jnp.abs(t0) ** 2):.6f}"
@@ -378,9 +383,9 @@ def plot_wavelength_sweep(
     num_samples: int = sweep_num_samples,
     N: int = default_sweep_N,
     num_points: int = default_num_points,
+    verbose: bool = False,
 ) -> None:
     import matplotlib.pyplot as plt
-    _validate_dense_truncation(N)
 
     wavelengths_nm = jnp.linspace(
         center_wavelength_nm - half_span_nm,
@@ -392,6 +397,7 @@ def plot_wavelength_sweep(
         wavelengths_nm,
         N=N,
         num_points=num_points,
+        verbose=verbose,
     )
 
     for ax, pol in zip(axes, ["TE", "TM"]):

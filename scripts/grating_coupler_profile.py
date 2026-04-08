@@ -45,7 +45,7 @@ def _profile_call(label: str, fn, top_n: int, sort_key: str) -> None:
 def run_design_profile(N: int, num_points: int, top_n: int, sort_key: str) -> None:
     _profile_call(
         label=f"design point N={N} num_points={num_points}",
-        fn=lambda: gc.run_design_point_demo(N=N, num_points=num_points),
+        fn=lambda: gc.run_design_point_demo(N=N, num_points=num_points, verbose=True),
         top_n=top_n,
         sort_key=sort_key,
     )
@@ -74,6 +74,7 @@ def run_sweep_profile(
             wavelengths_nm,
             N=N,
             num_points=num_points,
+            verbose=True,
         ),
         top_n=top_n,
         sort_key=sort_key,
