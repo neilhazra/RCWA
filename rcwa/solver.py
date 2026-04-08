@@ -127,36 +127,6 @@ class Solver:
         tm = jnp.where(valid[..., 1, None], pair[..., 1], fallback[..., 1])
         return te, tm
 
-    @staticmethod
-    def _pair_backward_indices(
-        eigenvalues: jnp.ndarray,
-        forward_idx: list[int],
-        backward_idx: list[int],
-    ) -> list[int]:
-        """Greedily pair each forward mode with the nearest opposite eigenvalue."""
-        if len(forward_idx) != len(backward_idx):
-            raise ValueError(
-                "Forward and backward mode lists must have the same length, "
-                f"got {len(forward_idx)} and {len(backward_idx)}."
-            )
-        if not forward_idx:
-            return []
-
-        forward_idx_array = jnp.asarray(forward_idx, dtype=jnp.int32)
-        backward_idx_array = jnp.asarray(backward_idx, dtype=jnp.int32)
-        pair_costs = jnp.abs(
-            eigenvalues[forward_idx_array][:, None] + eigenvalues[backward_idx_array][None, :]
-        )
-
-        available = jnp.ones(backward_idx_array.shape[0], dtype=bool)
-        paired_backward_idx: list[int] = []
-        for row in range(len(forward_idx)):
-            masked_costs = jnp.where(available, pair_costs[row], jnp.inf)
-            col = int(jnp.argmin(masked_costs))
-            paired_backward_idx.append(int(backward_idx_array[col]))
-            available[col] = False
-        return paired_backward_idx
-
     def diagonalize_sort_isotropic_modes(Q_iso: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Diagonalize isotropic half-space modes harmonic-by-harmonic.
 
@@ -223,79 +193,26 @@ class Solver:
         Solver._log(verbose, "Finished scipy.linalg.eig; normalizing layer eigenvectors")
         eigenvectors = Solver._normalize_columns(eigenvectors)
         half = Q.shape[0] // 2
-
         Solver._log(verbose, "Starting layer mode direction classification and sorting")
         direction_metric = jnp.where(
             jnp.abs(jnp.imag(eigenvalues)) > tol,
             jnp.imag(eigenvalues),
             -jnp.real(eigenvalues),
         )
-
-        if reference_fields is None:
-            Solver._log(verbose, "Sorting layer modes without reference-field overlap data")
-            sort_idx = jnp.argsort(-direction_metric)
-            forward_idx = [int(i) for i in sort_idx[:half]]
-            backward_idx = [int(i) for i in sort_idx[half:]]
-            paired_backward_idx = Solver._pair_backward_indices(
-                eigenvalues,
-                forward_idx,
-                backward_idx,
-            )
-            Solver._log(verbose, "Finished greedy forward/backward mode pairing")
-            sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
-            return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
-
         Solver._log(verbose, "Computing reference-basis overlaps for layer mode sorting")
         ref_coeffs = jnp.linalg.solve(reference_fields, eigenvectors)
         forward_weight = jnp.linalg.norm(ref_coeffs[:half, :], axis=0)
         backward_weight = jnp.linalg.norm(ref_coeffs[half:, :], axis=0)
         overlap_score = forward_weight - backward_weight
-
-        forward_idx: list[int] = []
-        backward_idx: list[int] = []
-        ambiguous_idx: list[int] = []
-
-        for i in range(int(Q.shape[0])):
-            metric = float(direction_metric[i])
-            if metric > tol:
-                forward_idx.append(i)
-            elif metric < -tol:
-                backward_idx.append(i)
-            else:
-                ambiguous_idx.append(i)
-
-        ambiguous_idx.sort(key=lambda i: float(overlap_score[i]), reverse=True)
-        while len(forward_idx) < half and ambiguous_idx:
-            forward_idx.append(ambiguous_idx.pop(0))
-        while len(backward_idx) < half and ambiguous_idx:
-            backward_idx.append(ambiguous_idx.pop(0))
-
-        if len(forward_idx) != half or len(backward_idx) != half:
-            Solver._log(verbose, "Ambiguous direction split encountered; falling back to pure direction-metric sort")
-            sort_idx = jnp.argsort(-direction_metric)
-            forward_idx = [int(i) for i in sort_idx[:half]]
-            backward_idx = [int(i) for i in sort_idx[half:]]
-            paired_backward_idx = Solver._pair_backward_indices(
-                eigenvalues,
-                forward_idx,
-                backward_idx,
-            )
-            Solver._log(verbose, "Finished greedy forward/backward mode pairing")
-            sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
-            return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
-
-        forward_idx.sort(
-            key=lambda i: (float(overlap_score[i]), float(direction_metric[i])),
-            reverse=True,
+        direction_metric_for_sort = jnp.where(
+            jnp.abs(direction_metric) > tol,
+            direction_metric,
+            0.0,
         )
-        paired_backward_idx = Solver._pair_backward_indices(
-            eigenvalues,
-            forward_idx,
-            backward_idx,
-        )
-        Solver._log(verbose, "Finished greedy forward/backward mode pairing")
-        sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
+        sort_idx = jnp.lexsort((-overlap_score, -direction_metric_for_sort))
+        Solver._log(verbose, "Finished lexicographic forward/backward sorting with overlap tie-break")
         return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
+
 
     @staticmethod
     def basis_change_transfer_matrix(left_fields: jnp.ndarray, right_fields: jnp.ndarray) -> jnp.ndarray:
@@ -304,7 +221,27 @@ class Solver:
 
     @staticmethod
     def transfer_to_scattering(T: jnp.ndarray) -> ScatteringMatrix:
-        """Convert a 2x2-block transfer matrix into an S-matrix."""
+        """Convert a 2x2-block transfer matrix into an S-matrix.
+
+        Throughout this solver we use the standard two-port convention
+
+            [a_L^-]   [S11  S12] [a_L^+]
+            [a_R^+] = [S21  S22] [a_R^-]
+
+        where:
+        - ``a_L^+`` are forward/right-going modes incident from the left
+        - ``a_L^-`` are backward/left-going modes leaving on the left
+        - ``a_R^-`` are backward/left-going modes incident from the right
+        - ``a_R^+`` are forward/right-going modes leaving on the right
+
+        The corresponding transfer matrix uses the convention
+
+            [a_R^+]   [T11  T12] [a_L^+]
+            [a_R^-] = [T21  T22] [a_L^-]
+
+        so ``S21`` is always the left-to-right transmission block and ``S12``
+        is always the right-to-left transmission block.
+        """
         half = T.shape[0] // 2
         T11 = T[:half, :half]
         T12 = T[:half, half:]
@@ -360,7 +297,26 @@ class Solver:
         eigenvalues: jnp.ndarray,
         thickness: float,
     ) -> ScatteringMatrix:
-        """Return the diagonal propagation S-matrix inside one layer's modal basis."""
+        """Return the diagonal propagation S-matrix inside one layer's modal basis.
+
+        Modal ordering convention:
+        - the first half of ``eigenvalues`` are forward/right-going layer modes
+        - the second half are backward/left-going layer modes
+
+        Scattering-port convention:
+
+            [a_L^-]   [S11  S12] [a_L^+]
+            [a_R^+] = [S21  S22] [a_R^-]
+
+        For a homogeneous layer there is no internal reflection, so ``S11`` and
+        ``S22`` vanish.
+
+        A forward mode incident from the left propagates to the right face, so
+        the forward propagation factor belongs in ``S21``.
+
+        A backward mode incident from the right propagates to the left face, so
+        the backward propagation factor belongs in ``S12``.
+        """
         n = eigenvalues.shape[0]
         if n % 2 != 0:
             raise ValueError(f"Expected an even number of eigenvalues, got shape[0]={n}.")
@@ -369,7 +325,7 @@ class Solver:
         X_forward = jnp.diag(jnp.exp(eigenvalues[:half] * thickness))
         X_backward = jnp.diag(jnp.exp(-eigenvalues[half:] * thickness))
         Z = jnp.zeros_like(X_forward)
-        return Z, X_forward, X_backward, Z
+        return Z, X_backward, X_forward, Z
 
     @staticmethod
     def redheffer_star_product(Sa: ScatteringMatrix, Sb: ScatteringMatrix) -> ScatteringMatrix:
@@ -495,7 +451,7 @@ class Solver:
         N: int,
         incident_pol: str = "TE",
         num_points: int = 512,
-        verbose: bool = False,
+        verbose: bool = True,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Return reflected and transmitted modal amplitudes for unit normal incidence."""
         Solver._log(verbose, f"Computing reflection/transmission for {incident_pol.upper()} incidence")

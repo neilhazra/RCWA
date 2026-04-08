@@ -148,7 +148,7 @@ def _transmitted_superstrate_electric_components_for_te_incidence(
     )
 
 
-def _assert_modal_propagation_pairing(
+def _assert_modal_propagation_blocks_match_eigenvalue_halves(
     eigenvalues: jnp.ndarray,
     thickness: float,
     atol: float = 1e-10,
@@ -156,11 +156,12 @@ def _assert_modal_propagation_pairing(
     half = eigenvalues.shape[0] // 2
     expected_forward = jnp.diag(jnp.exp(eigenvalues[:half] * thickness))
     expected_backward = jnp.diag(jnp.exp(-eigenvalues[half:] * thickness))
-    _, S12, S21, _ = Solver.modal_propagation_scattering_matrix(eigenvalues, thickness)
+    S11, S12, S21, S22 = Solver.modal_propagation_scattering_matrix(eigenvalues, thickness)
 
-    assert jnp.allclose(expected_forward, expected_backward, atol=atol)
-    assert jnp.allclose(S12, expected_forward, atol=atol)
-    assert jnp.allclose(S21, expected_backward, atol=atol)
+    assert jnp.allclose(S11, 0, atol=atol)
+    assert jnp.allclose(S22, 0, atol=atol)
+    assert jnp.allclose(S12, expected_backward, atol=atol)
+    assert jnp.allclose(S21, expected_forward, atol=atol)
 
 
 def _explicit_transfer_to_scattering(T: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -294,6 +295,41 @@ def test_isotropic_mode_fields_have_global_forward_backward_split(
     assert jnp.max(jnp.abs(T[half:, :half])) < 1e-10
 
 
+def test_layer_mode_sort_uses_overlap_to_break_zeroed_direction_metric_ties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eigenvalues = jnp.array([0.4j, 0.0, 0.0, -0.4j], dtype=jnp.complex128)
+    eigenvectors = jnp.eye(4, dtype=jnp.complex128)
+
+    def fake_eig(_: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        return eigenvalues.copy(), eigenvectors.copy()
+
+    monkeypatch.setattr(scipy.linalg, "eig", fake_eig)
+
+    # In the reference basis, columns 0 and 2 are forward-like while columns 1
+    # and 3 are backward-like. The two zero-metric modes therefore need the
+    # overlap score to decide their relative order.
+    reference_coeffs = jnp.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=jnp.complex128,
+    )
+    reference_fields = jnp.linalg.inv(reference_coeffs)
+
+    _, sorted_vectors = Solver.diagonalize_sort_layer_modes(
+        jnp.eye(4, dtype=jnp.complex128),
+        reference_fields=reference_fields,
+        tol=1e-9,
+    )
+
+    expected = jnp.eye(4, dtype=jnp.complex128)[:, [0, 2, 1, 3]]
+    assert jnp.array_equal(sorted_vectors, expected)
+
+
 def test_modes_to_fields_matrix_reorders_columns_into_solver_modal_layout() -> None:
     evecs = jnp.arange(3 * 4 * 4, dtype=jnp.complex128).reshape(3, 4, 4)
     fields = Solver.modes_to_fields_matrix(evecs)
@@ -363,11 +399,11 @@ def test_modal_propagation_scattering_matrix_is_reflectionless() -> None:
     assert jnp.allclose(S11, 0, atol=1e-12)
     assert jnp.allclose(S22, 0, atol=1e-12)
     assert jnp.allclose(expected_forward, expected_backward, atol=1e-12)
-    assert jnp.allclose(S12, expected_forward, atol=1e-12)
-    assert jnp.allclose(S21, expected_backward, atol=1e-12)
+    assert jnp.allclose(S12, expected_backward, atol=1e-12)
+    assert jnp.allclose(S21, expected_forward, atol=1e-12)
 
 
-def test_modal_propagation_scattering_matrix_matches_backward_eigenvalue_half(
+def test_modal_propagation_scattering_matrix_uses_isotropic_forward_and_backward_halves_directly(
     uniform_interface_stack: Stack,
 ) -> None:
     N = 0
@@ -376,11 +412,15 @@ def test_modal_propagation_scattering_matrix_matches_backward_eigenvalue_half(
         uniform_interface_stack.get_Q_substrate_normalized(N)
     )
     zero_harmonic_eigenvalues = eigenvalues[Stack.zero_harmonic_index(N)]
-    _assert_modal_propagation_pairing(zero_harmonic_eigenvalues, thickness, atol=1e-12)
+    _assert_modal_propagation_blocks_match_eigenvalue_halves(
+        zero_harmonic_eigenvalues,
+        thickness,
+        atol=1e-12,
+    )
 
 
 @pytest.mark.parametrize("N", [1, 2])
-def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_normal_birefringent_layer(
+def test_modal_propagation_scattering_matrix_uses_anisotropic_forward_and_backward_halves_directly(
     N: int,
 ) -> None:
     wavelength_nm = 633.0
@@ -422,7 +462,7 @@ def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_norma
     q_matrix = reorder @ stack.layer_Q_matrix_normalized(0, N, num_points=256) @ reorder.T
     eigenvalues, _ = Solver.layer_mode_fields(q_matrix, substrate_fields)
 
-    _assert_modal_propagation_pairing(
+    _assert_modal_propagation_blocks_match_eigenvalue_halves(
         eigenvalues,
         stack.thickness_normalized(0),
         atol=1e-10,
@@ -430,7 +470,7 @@ def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_norma
 
 
 @pytest.mark.parametrize("N", [1, 2])
-def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_normal_lossy_anisotropic_layer(
+def test_modal_propagation_scattering_matrix_uses_lossy_anisotropic_forward_and_backward_halves_directly(
     N: int,
 ) -> None:
     wavelength_nm = 610.0
@@ -471,22 +511,11 @@ def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_norma
     q_matrix = reorder @ stack.layer_Q_matrix_normalized(0, N, num_points=256) @ reorder.T
     eigenvalues, _ = Solver.layer_mode_fields(q_matrix, substrate_fields)
 
-    _assert_modal_propagation_pairing(
+    _assert_modal_propagation_blocks_match_eigenvalue_halves(
         eigenvalues,
         stack.thickness_normalized(0),
         atol=1e-10,
     )
-
-
-def test_pair_backward_indices_matches_nearest_opposite_eigenvalue_greedy_rule() -> None:
-    eigenvalues = jnp.array(
-        [0.42 + 0.10j, 0.83 + 0.25j, -0.81 - 0.23j, -0.40 - 0.09j],
-        dtype=jnp.complex128,
-    )
-
-    paired = Solver._pair_backward_indices(eigenvalues, forward_idx=[0, 1], backward_idx=[2, 3])
-
-    assert paired == [3, 2]
 
 
 def test_redheffer_star_product_multiplies_reflectionless_transmissions() -> None:

@@ -11,7 +11,7 @@ n_sup = 1.0
 period_nm = 399.8
 d_slab_nm = 120.0
 d_grating_nm = 10.0
-duty_cycle = 0.25
+duty_cycle = 0.5
 design_wl = 633.0
 C_NM_THz = 299792.458
 
