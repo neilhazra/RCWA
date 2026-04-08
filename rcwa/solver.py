@@ -16,6 +16,12 @@ class Solver:
     """Modal RCWA solver using adjacent-port scattering matrices."""
 
     @staticmethod
+    def _log(verbose: bool, message: str) -> None:
+        """Print a solver progress message when verbose output is enabled."""
+        if verbose:
+            print(f"[Solver] {message}")
+
+    @staticmethod
     @lru_cache(maxsize=None)
     def reorder_matrix(N: int) -> jnp.ndarray:
         """Map component-major field ordering into harmonic-major ordering."""
@@ -350,37 +356,68 @@ class Solver:
         return result
 
     @staticmethod
-    def total_scattering_matrix(stack: Stack, N: int, num_points: int = 512) -> ScatteringMatrix:
+    def total_scattering_matrix(
+        stack: Stack,
+        N: int,
+        num_points: int = 512,
+        verbose: bool = False,
+    ) -> ScatteringMatrix:
         """Return the stack S-matrix in substrate/superstrate modal bases."""
+        Solver._log(
+            verbose,
+            (
+                f"Building total scattering matrix: N={N}, num_points={num_points}, "
+                f"num_layers={len(stack.layers)}"
+            ),
+        )
         q_matrices = stack.build_all_Q_matrices_normalized(N, num_points=num_points)
+        Solver._log(verbose, f"Built {len(q_matrices)} component-major layer Q matrices")
         q_matrices_harmonic_major = [
             Solver.component_to_harmonic_major(q_matrix) for q_matrix in q_matrices
         ]
+        if q_matrices_harmonic_major:
+            Solver._log(verbose, "Reordered layer Q matrices into harmonic-major basis")
 
+        Solver._log(verbose, "Diagonalizing isotropic substrate modes")
         substrate_fields = Solver.isotropic_mode_fields(
             stack.get_Q_substrate_normalized(N, num_points=num_points),
             N,
         )
+        Solver._log(verbose, "Diagonalizing isotropic superstrate modes")
         superstrate_fields = Solver.isotropic_mode_fields(
             stack.get_Q_superstrate_normalized(N, num_points=num_points),
             N,
         )
 
         if not q_matrices_harmonic_major:
+            Solver._log(verbose, "No internal layers found; returning direct substrate/superstrate basis change")
             return Solver.basis_change_scattering_matrix(substrate_fields, superstrate_fields)
 
         layer_modes: list[tuple[jnp.ndarray, jnp.ndarray]] = []
         reference_fields = substrate_fields
-        for q_matrix in q_matrices_harmonic_major:
+        for i, q_matrix in enumerate(q_matrices_harmonic_major):
+            Solver._log(
+                verbose,
+                f"Diagonalizing layer {i} Q matrix with shape {q_matrix.shape}",
+            )
             mode_data = Solver.layer_mode_fields(q_matrix, reference_fields)
             layer_modes.append(mode_data)
             reference_fields = mode_data[1]
+            Solver._log(
+                verbose,
+                f"Sorted layer {i} modes into forward/backward basis ({mode_data[0].shape[0]} eigenvalues)",
+            )
 
+        Solver._log(verbose, "Building substrate-to-layer-0 basis-change scattering matrix")
         S_list: list[ScatteringMatrix] = [
             Solver.basis_change_scattering_matrix(substrate_fields, layer_modes[0][1])
         ]
 
         for i, (layer_eigenvalues, layer_fields) in enumerate(layer_modes):
+            Solver._log(
+                verbose,
+                f"Building modal propagation scattering matrix for layer {i} with thickness {stack.thickness_normalized(i):.6g}",
+            )
             S_list.append(
                 Solver.modal_propagation_scattering_matrix(
                     layer_eigenvalues,
@@ -390,8 +427,14 @@ class Solver:
             right_fields = (
                 superstrate_fields if i == len(layer_modes) - 1 else layer_modes[i + 1][1]
             )
+            target_name = "superstrate" if i == len(layer_modes) - 1 else f"layer {i + 1}"
+            Solver._log(
+                verbose,
+                f"Building basis-change scattering matrix from layer {i} to {target_name}",
+            )
             S_list.append(Solver.basis_change_scattering_matrix(layer_fields, right_fields))
 
+        Solver._log(verbose, f"Concatenating {len(S_list)} scattering matrices with Redheffer star products")
         return Solver.chain_scattering_matrices(S_list)
 
     @staticmethod
@@ -400,9 +443,16 @@ class Solver:
         N: int,
         incident_pol: str = "TE",
         num_points: int = 512,
+        verbose: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Return reflected and transmitted modal amplitudes for unit normal incidence."""
-        S11, _, S21, _ = Solver.total_scattering_matrix(stack, N, num_points=num_points)
+        Solver._log(verbose, f"Computing reflection/transmission for {incident_pol.upper()} incidence")
+        S11, _, S21, _ = Solver.total_scattering_matrix(
+            stack,
+            N,
+            num_points=num_points,
+            verbose=verbose,
+        )
         half = 2 * Stack.num_harmonics(N)
 
         inc = jnp.zeros(half, dtype=jnp.complex128)
