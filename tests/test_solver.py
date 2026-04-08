@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from rcwa import Layer, Solver, Stack
 
@@ -34,6 +35,132 @@ def _zero_order_field_rt(stack: Stack, N: int, pol: str, num_points: int = 256) 
     r0 = r[zero_mode] * (E_sub_bwd / E_sub_fwd)
     t0 = t[zero_mode] * (E_sup_fwd / E_sub_fwd)
     return r0, t0
+
+
+def _normal_incidence_characteristic_rt(
+    n_incident: float,
+    n_exit: float,
+    layer_indices: list[float],
+    layer_thicknesses_nm: list[float],
+    wavelength_nm: float,
+) -> tuple[complex, complex]:
+    matrix = jnp.eye(2, dtype=jnp.complex128)
+
+    for n_layer, thickness_nm in zip(layer_indices, layer_thicknesses_nm):
+        phase = 2 * jnp.pi * n_layer * thickness_nm / wavelength_nm
+        layer_matrix = jnp.array(
+            [
+                [jnp.cos(phase), 1j * jnp.sin(phase) / n_layer],
+                [1j * n_layer * jnp.sin(phase), jnp.cos(phase)],
+            ],
+            dtype=jnp.complex128,
+        )
+        matrix = matrix @ layer_matrix
+
+    B = matrix[0, 0] + matrix[0, 1] * n_exit
+    C = matrix[1, 0] + matrix[1, 1] * n_exit
+    reflection = (n_incident * B - C) / (n_incident * B + C)
+    transmission = 2 * n_incident / (n_incident * B + C)
+    return reflection, transmission
+
+
+def _normal_incidence_reflectance_transmittance(
+    n_incident: float,
+    n_exit: float,
+    layer_indices: list[float],
+    layer_thicknesses_nm: list[float],
+    wavelength_nm: float,
+) -> tuple[float, float]:
+    reflection, transmission = _normal_incidence_characteristic_rt(
+        n_incident,
+        n_exit,
+        layer_indices,
+        layer_thicknesses_nm,
+        wavelength_nm,
+    )
+    reflectance = jnp.abs(reflection) ** 2
+    transmittance = jnp.abs(transmission) ** 2 * (n_exit / n_incident)
+    return reflectance, transmittance
+
+
+def _rotate_in_plane_eps(eps_local: jnp.ndarray, theta_rad: float) -> jnp.ndarray:
+    c = jnp.cos(theta_rad)
+    s = jnp.sin(theta_rad)
+    rotation = jnp.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=jnp.complex128,
+    )
+    return rotation @ eps_local @ rotation.T
+
+
+def _rotated_in_plane_birefringent_eps(no: float, ne: float, theta_rad: float) -> jnp.ndarray:
+    eps_local = jnp.diag(jnp.array([no**2, ne**2, 1.0], dtype=jnp.complex128))
+    return _rotate_in_plane_eps(eps_local, theta_rad)
+
+
+def _zero_order_outgoing_electric_components(
+    stack: Stack,
+    modal_coeffs: jnp.ndarray,
+    side: str,
+    direction: str,
+    num_points: int = 256,
+) -> tuple[complex, complex]:
+    if side == "substrate":
+        q_matrix = stack.get_Q_substrate_normalized(0, num_points=num_points)
+        eps = stack.eps_substrate
+    elif side == "superstrate":
+        q_matrix = stack.get_Q_superstrate_normalized(0, num_points=num_points)
+        eps = stack.eps_superstrate
+    else:
+        raise ValueError(f"Unknown side={side!r}")
+
+    if direction == "forward":
+        te_col, tm_col = 0, 1
+    elif direction == "backward":
+        te_col, tm_col = 2, 3
+    else:
+        raise ValueError(f"Unknown direction={direction!r}")
+
+    _, evecs = Solver.diagonalize_sort_isotropic_modes(q_matrix)
+    zero = Stack.zero_harmonic_index(0)
+    te_mode = Solver.zero_order_mode_index(0, "TE")
+    tm_mode = Solver.zero_order_mode_index(0, "TM")
+    E_y = modal_coeffs[te_mode] * evecs[zero, 2, te_col]
+    E_x = modal_coeffs[tm_mode] * evecs[zero, 3, tm_col] / eps
+    return E_x, E_y
+
+
+def _transmitted_superstrate_electric_components_for_te_incidence(
+    stack: Stack,
+    num_points: int = 256,
+) -> tuple[complex, complex]:
+    _, transmitted = Solver.reflection_transmission(stack, 0, "TE", num_points=num_points)
+    return _zero_order_outgoing_electric_components(
+        stack,
+        transmitted,
+        side="superstrate",
+        direction="forward",
+        num_points=num_points,
+    )
+
+
+def _assert_modal_propagation_pairing(
+    eigenvalues: jnp.ndarray,
+    thickness: float,
+    atol: float = 1e-10,
+) -> None:
+    half = eigenvalues.shape[0] // 2
+    expected_forward = jnp.diag(jnp.exp(eigenvalues[:half] * thickness))
+    expected_backward = jnp.diag(jnp.exp(-eigenvalues[half:] * thickness))
+    _, S12, S21, _ = Solver.modal_propagation_scattering_matrix(eigenvalues, thickness)
+
+    assert jnp.allclose(expected_forward, expected_backward, atol=atol)
+    assert jnp.allclose(S12, expected_forward, atol=atol)
+    assert jnp.allclose(S21, expected_backward, atol=atol)
 
 
 def test_reorder_matrix_layout() -> None:
@@ -143,12 +270,125 @@ def test_modal_propagation_scattering_matrix_is_reflectionless() -> None:
     eigenvalues = jnp.array([0.2j, 0.5j, -0.2j, -0.5j], dtype=jnp.complex128)
     thickness = 1.7
     S11, S12, S21, S22 = Solver.modal_propagation_scattering_matrix(eigenvalues, thickness)
-    expected = jnp.diag(jnp.exp(eigenvalues[:2] * thickness))
+    expected_forward = jnp.diag(jnp.exp(eigenvalues[:2] * thickness))
+    expected_backward = jnp.diag(jnp.exp(-eigenvalues[2:] * thickness))
 
     assert jnp.allclose(S11, 0, atol=1e-12)
     assert jnp.allclose(S22, 0, atol=1e-12)
-    assert jnp.allclose(S12, expected, atol=1e-12)
-    assert jnp.allclose(S21, expected, atol=1e-12)
+    assert jnp.allclose(expected_forward, expected_backward, atol=1e-12)
+    assert jnp.allclose(S12, expected_forward, atol=1e-12)
+    assert jnp.allclose(S21, expected_backward, atol=1e-12)
+
+
+def test_modal_propagation_scattering_matrix_matches_backward_eigenvalue_half(
+    uniform_interface_stack: Stack,
+) -> None:
+    N = 0
+    thickness = 0.73
+    eigenvalues, _ = Solver.diagonalize_sort_isotropic_modes(
+        uniform_interface_stack.get_Q_substrate_normalized(N)
+    )
+    zero_harmonic_eigenvalues = eigenvalues[Stack.zero_harmonic_index(N)]
+    _assert_modal_propagation_pairing(zero_harmonic_eigenvalues, thickness, atol=1e-12)
+
+
+@pytest.mark.parametrize("N", [1, 2])
+def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_normal_birefringent_layer(
+    N: int,
+) -> None:
+    wavelength_nm = 633.0
+    period_nm = 500.0
+    kappa_inv_nm = 0.002
+    theta_rad = jnp.deg2rad(27.0)
+    c = jnp.cos(theta_rad)
+    s = jnp.sin(theta_rad)
+    rotation = jnp.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=jnp.complex128,
+    )
+    eps_local = jnp.diag(jnp.array([2.05**2, 1.52**2, 1.67**2], dtype=jnp.complex128))
+    eps_tensor = rotation @ eps_local @ rotation.T
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=kappa_inv_nm,
+        eps_substrate=1.0,
+        eps_superstrate=1.0,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm=120.0,
+            eps_tensor=eps_tensor,
+            x_domain_nm=(0.0, period_nm),
+        )
+    )
+
+    reorder = Solver.reorder_matrix(N)
+    substrate_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_substrate_normalized(N, num_points=256),
+        N,
+    )
+    q_matrix = reorder @ stack.layer_Q_matrix_normalized(0, N, num_points=256) @ reorder.T
+    eigenvalues, _ = Solver.layer_mode_fields(q_matrix, substrate_fields)
+
+    _assert_modal_propagation_pairing(
+        eigenvalues,
+        stack.thickness_normalized(0),
+        atol=1e-10,
+    )
+
+
+@pytest.mark.parametrize("N", [1, 2])
+def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_normal_lossy_anisotropic_layer(
+    N: int,
+) -> None:
+    wavelength_nm = 610.0
+    period_nm = 480.0
+    kappa_inv_nm = 0.0018
+    theta_rad = jnp.deg2rad(31.0)
+    eps_local = jnp.diag(
+        jnp.array(
+            [
+                (1.82 + 0.04j) ** 2,
+                (1.46 + 0.08j) ** 2,
+                (1.61 + 0.03j) ** 2,
+            ],
+            dtype=jnp.complex128,
+        )
+    )
+    eps_tensor = _rotate_in_plane_eps(eps_local, theta_rad)
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=kappa_inv_nm,
+        eps_substrate=1.0,
+        eps_superstrate=1.0,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm=115.0,
+            eps_tensor=eps_tensor,
+            x_domain_nm=(0.0, period_nm),
+        )
+    )
+
+    reorder = Solver.reorder_matrix(N)
+    substrate_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_substrate_normalized(N, num_points=256),
+        N,
+    )
+    q_matrix = reorder @ stack.layer_Q_matrix_normalized(0, N, num_points=256) @ reorder.T
+    eigenvalues, _ = Solver.layer_mode_fields(q_matrix, substrate_fields)
+
+    _assert_modal_propagation_pairing(
+        eigenvalues,
+        stack.thickness_normalized(0),
+        atol=1e-10,
+    )
 
 
 def test_redheffer_star_product_multiplies_reflectionless_transmissions() -> None:
@@ -246,6 +486,377 @@ def test_multilayer_uniform_stack_total_scattering_is_finite() -> None:
     S = Solver.total_scattering_matrix(stack, 1, num_points=256)
     for block in S:
         assert jnp.all(jnp.isfinite(block))
+
+
+def test_single_isotropic_quarter_wave_film_matches_analytic_reflectance() -> None:
+    wavelength_nm = 550.0
+    n_incident = 1.0
+    n_film = 2.0
+    n_exit = 1.5
+    thickness_nm = wavelength_nm / (4 * n_film)
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_incident**2,
+        eps_superstrate=n_exit**2,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm,
+            n_film**2 * jnp.eye(3),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    reflectance_expected, transmittance_expected = _normal_incidence_reflectance_transmittance(
+        n_incident,
+        n_exit,
+        [n_film],
+        [thickness_nm],
+        wavelength_nm,
+    )
+
+    for pol in ["TE", "TM"]:
+        r0, t0 = _zero_order_field_rt(stack, 0, pol)
+        reflectance = jnp.abs(r0) ** 2
+        transmittance = (
+            jnp.abs(t0) ** 2 * (n_exit / n_incident)
+            if pol == "TE"
+            else jnp.abs(t0) ** 2 * (n_incident / n_exit)
+        )
+
+        assert jnp.isclose(reflectance, reflectance_expected, atol=1e-10)
+        assert jnp.isclose(transmittance, transmittance_expected, atol=1e-10)
+
+
+def test_dielectric_mirror_reflectance_matches_analytic_stack_and_grows_with_periods() -> None:
+    wavelength_nm = 550.0
+    n_incident = 1.0
+    n_exit = 1.5
+    n_high = 2.2
+    n_low = 1.45
+    thickness_high_nm = wavelength_nm / (4 * n_high)
+    thickness_low_nm = wavelength_nm / (4 * n_low)
+
+    reflectances: list[float] = []
+    for periods in [1, 4]:
+        stack = Stack(
+            wavelength_nm=wavelength_nm,
+            kappa_inv_nm=0.0,
+            eps_substrate=n_incident**2,
+            eps_superstrate=n_exit**2,
+        )
+        layer_indices: list[float] = []
+        layer_thicknesses_nm: list[float] = []
+
+        for _ in range(periods):
+            stack.add_layer(
+                Layer.uniform(
+                    thickness_high_nm,
+                    n_high**2 * jnp.eye(3),
+                    x_domain_nm=(0.0, 500.0),
+                )
+            )
+            stack.add_layer(
+                Layer.uniform(
+                    thickness_low_nm,
+                    n_low**2 * jnp.eye(3),
+                    x_domain_nm=(0.0, 500.0),
+                )
+            )
+            layer_indices.extend([n_high, n_low])
+            layer_thicknesses_nm.extend([thickness_high_nm, thickness_low_nm])
+
+        reflectance_expected, transmittance_expected = _normal_incidence_reflectance_transmittance(
+            n_incident,
+            n_exit,
+            layer_indices,
+            layer_thicknesses_nm,
+            wavelength_nm,
+        )
+
+        r0_te, t0_te = _zero_order_field_rt(stack, 0, "TE")
+        r0_tm, t0_tm = _zero_order_field_rt(stack, 0, "TM")
+
+        reflectance_te = jnp.abs(r0_te) ** 2
+        reflectance_tm = jnp.abs(r0_tm) ** 2
+        transmittance_te = jnp.abs(t0_te) ** 2 * (n_exit / n_incident)
+        transmittance_tm = jnp.abs(t0_tm) ** 2 * (n_incident / n_exit)
+
+        assert jnp.isclose(reflectance_te, reflectance_expected, atol=1e-10)
+        assert jnp.isclose(reflectance_tm, reflectance_expected, atol=1e-10)
+        assert jnp.isclose(transmittance_te, transmittance_expected, atol=1e-10)
+        assert jnp.isclose(transmittance_tm, transmittance_expected, atol=1e-10)
+
+        reflectances.append(float(reflectance_te))
+
+    assert reflectances[1] > reflectances[0]
+    assert reflectances[1] > 0.9
+
+
+def test_rotated_quarter_wave_plate_mixes_polarization_when_axis_turns() -> None:
+    wavelength_nm = 633.0
+    n_ordinary = 1.5
+    n_extraordinary = 1.6
+    n_ambient = jnp.sqrt(n_ordinary * n_extraordinary)
+    thickness_nm = wavelength_nm / (4 * (n_extraordinary - n_ordinary))
+
+    transmitted_cross_components: list[float] = []
+    transmitted_phase_shifts: list[float] = []
+
+    for degrees in [0.0, 22.5, 45.0]:
+        theta_rad = jnp.deg2rad(degrees)
+        stack = Stack(
+            wavelength_nm=wavelength_nm,
+            kappa_inv_nm=0.0,
+            eps_substrate=n_ambient**2,
+            eps_superstrate=n_ambient**2,
+        )
+        stack.add_layer(
+            Layer.uniform(
+                thickness_nm,
+                _rotated_in_plane_birefringent_eps(n_ordinary, n_extraordinary, theta_rad),
+                x_domain_nm=(0.0, 500.0),
+            )
+        )
+
+        E_x, E_y = _transmitted_superstrate_electric_components_for_te_incidence(stack)
+        phase = jnp.angle(E_x) - jnp.angle(E_y)
+        phase = (phase + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+        transmitted_cross_components.append(float(jnp.abs(E_x)))
+        transmitted_phase_shifts.append(float(phase))
+
+    assert transmitted_cross_components[0] < 1e-10
+    assert transmitted_cross_components[0] < transmitted_cross_components[1] < transmitted_cross_components[2]
+    assert jnp.isclose(transmitted_cross_components[2], 0.3833762304577446, atol=5e-3)
+    assert jnp.isclose(transmitted_phase_shifts[2], -jnp.pi / 2, atol=5e-2)
+
+
+@pytest.mark.parametrize(("pol", "cross_pol"), [("TE", "TM"), ("TM", "TE")])
+def test_axis_aligned_lossy_anisotropic_film_preserves_polarization_and_is_passive(
+    pol: str,
+    cross_pol: str,
+) -> None:
+    wavelength_nm = 532.0
+    n_ambient = 1.27
+    thickness_nm = 140.0
+    eps_tensor = jnp.diag(
+        jnp.array(
+            [
+                (1.83 + 0.07j) ** 2,
+                (1.56 + 0.03j) ** 2,
+                (1.67 + 0.05j) ** 2,
+            ],
+            dtype=jnp.complex128,
+        )
+    )
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_ambient**2,
+        eps_superstrate=n_ambient**2,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm,
+            eps_tensor,
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    reflected, transmitted = Solver.reflection_transmission(stack, 0, pol, num_points=256)
+    cross_mode = Solver.zero_order_mode_index(0, cross_pol)
+    reflected_E_x, reflected_E_y = _zero_order_outgoing_electric_components(
+        stack,
+        reflected,
+        side="substrate",
+        direction="backward",
+    )
+    transmitted_E_x, transmitted_E_y = _zero_order_outgoing_electric_components(
+        stack,
+        transmitted,
+        side="superstrate",
+        direction="forward",
+    )
+    reflectance = jnp.abs(reflected_E_x) ** 2 + jnp.abs(reflected_E_y) ** 2
+    transmittance = jnp.abs(transmitted_E_x) ** 2 + jnp.abs(transmitted_E_y) ** 2
+
+    assert jnp.abs(reflected[cross_mode]) < 1e-12
+    assert jnp.abs(transmitted[cross_mode]) < 1e-12
+    assert jnp.isfinite(reflectance)
+    assert jnp.isfinite(transmittance)
+    assert reflectance + transmittance < 0.98
+
+
+def test_ninety_degree_rotation_of_lossy_anisotropic_film_swaps_te_tm_responses() -> None:
+    wavelength_nm = 532.0
+    n_ambient = 1.27
+    thickness_nm = 140.0
+    eps_local = jnp.diag(
+        jnp.array(
+            [
+                (1.83 + 0.07j) ** 2,
+                (1.56 + 0.03j) ** 2,
+                (1.67 + 0.05j) ** 2,
+            ],
+            dtype=jnp.complex128,
+        )
+    )
+
+    stack_unrotated = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_ambient**2,
+        eps_superstrate=n_ambient**2,
+    )
+    stack_unrotated.add_layer(
+        Layer.uniform(
+            thickness_nm,
+            _rotate_in_plane_eps(eps_local, 0.0),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    stack_rotated = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_ambient**2,
+        eps_superstrate=n_ambient**2,
+    )
+    stack_rotated.add_layer(
+        Layer.uniform(
+            thickness_nm,
+            _rotate_in_plane_eps(eps_local, jnp.pi / 2),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    r_te_unrot, t_te_unrot = _zero_order_field_rt(stack_unrotated, 0, "TE")
+    r_tm_unrot, t_tm_unrot = _zero_order_field_rt(stack_unrotated, 0, "TM")
+    r_te_rot, t_te_rot = _zero_order_field_rt(stack_rotated, 0, "TE")
+    r_tm_rot, t_tm_rot = _zero_order_field_rt(stack_rotated, 0, "TM")
+
+    assert jnp.isclose(t_te_rot, t_tm_unrot, atol=1e-10)
+    assert jnp.isclose(t_tm_rot, t_te_unrot, atol=1e-10)
+    assert jnp.isclose(jnp.abs(r_te_rot) ** 2, jnp.abs(r_tm_unrot) ** 2, atol=1e-10)
+    assert jnp.isclose(jnp.abs(r_tm_rot) ** 2, jnp.abs(r_te_unrot) ** 2, atol=1e-10)
+
+
+def test_rotated_lossy_anisotropic_film_mixes_polarization_and_absorbs_power() -> None:
+    wavelength_nm = 633.0
+    n_ambient = 1.35
+    thickness_nm = 180.0
+    eps_local = jnp.diag(
+        jnp.array(
+            [
+                (1.50 + 0.01j) ** 2,
+                (1.72 + 0.05j) ** 2,
+                (1.62 + 0.03j) ** 2,
+            ],
+            dtype=jnp.complex128,
+        )
+    )
+
+    stack_aligned = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_ambient**2,
+        eps_superstrate=n_ambient**2,
+    )
+    stack_aligned.add_layer(
+        Layer.uniform(
+            thickness_nm,
+            eps_local,
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    stack_rotated = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_ambient**2,
+        eps_superstrate=n_ambient**2,
+    )
+    stack_rotated.add_layer(
+        Layer.uniform(
+            thickness_nm,
+            _rotate_in_plane_eps(eps_local, jnp.deg2rad(33.0)),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    _, transmitted_aligned = Solver.reflection_transmission(
+        stack_aligned,
+        0,
+        "TE",
+        num_points=256,
+    )
+    reflected_rotated, transmitted_rotated = Solver.reflection_transmission(
+        stack_rotated,
+        0,
+        "TE",
+        num_points=256,
+    )
+
+    transmitted_aligned_E_x, _ = _zero_order_outgoing_electric_components(
+        stack_aligned,
+        transmitted_aligned,
+        side="superstrate",
+        direction="forward",
+    )
+    reflected_rotated_E_x, reflected_rotated_E_y = _zero_order_outgoing_electric_components(
+        stack_rotated,
+        reflected_rotated,
+        side="substrate",
+        direction="backward",
+    )
+    transmitted_rotated_E_x, transmitted_rotated_E_y = _zero_order_outgoing_electric_components(
+        stack_rotated,
+        transmitted_rotated,
+        side="superstrate",
+        direction="forward",
+    )
+    reflectance = jnp.abs(reflected_rotated_E_x) ** 2 + jnp.abs(reflected_rotated_E_y) ** 2
+    transmittance = jnp.abs(transmitted_rotated_E_x) ** 2 + jnp.abs(transmitted_rotated_E_y) ** 2
+
+    assert jnp.abs(transmitted_aligned_E_x) < 1e-12
+    assert jnp.abs(transmitted_rotated_E_x) > 5e-2
+    assert reflectance + transmittance < 0.9
+
+
+def test_quarter_wave_plate_at_45_degrees_produces_nearly_equal_transmitted_field_components() -> None:
+    wavelength_nm = 633.0
+    n_ordinary = 1.5
+    n_extraordinary = 1.6
+    n_ambient = jnp.sqrt(n_ordinary * n_extraordinary)
+    thickness_nm = wavelength_nm / (4 * (n_extraordinary - n_ordinary))
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=0.0,
+        eps_substrate=n_ambient**2,
+        eps_superstrate=n_ambient**2,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm,
+            _rotated_in_plane_birefringent_eps(
+                n_ordinary,
+                n_extraordinary,
+                jnp.deg2rad(45.0),
+            ),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    reflected, _ = Solver.reflection_transmission(stack, 0, "TE", num_points=256)
+    E_x, E_y = _transmitted_superstrate_electric_components_for_te_incidence(stack)
+
+    assert float(jnp.sum(jnp.abs(reflected) ** 2)) < 5e-3
+    assert jnp.isclose(jnp.abs(E_x), jnp.abs(E_y), rtol=2e-2, atol=2e-3)
 
 
 def test_piecewise_stack_response_is_finite(sample_problem: dict) -> None:

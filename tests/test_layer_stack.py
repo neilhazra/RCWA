@@ -7,6 +7,47 @@ import pytest
 from rcwa import Layer, Solver, Stack
 
 
+def _reconstruct_from_centered_coeffs(
+    coeffs: jnp.ndarray,
+    x_nm: jnp.ndarray,
+    x_domain_nm: tuple[float, float],
+) -> jnp.ndarray:
+    x_min_nm, x_max_nm = x_domain_nm
+    period_nm = x_max_nm - x_min_nm
+    max_order = (coeffs.shape[0] - 1) // 2
+    orders = jnp.arange(-max_order, max_order + 1)
+    phase = 2j * jnp.pi * (x_nm[:, None] - x_min_nm) * orders[None, :] / period_nm
+    return jnp.sum(coeffs[None, :] * jnp.exp(phase), axis=1)
+
+
+def _smooth_diagonal_layer_with_known_spectrum() -> Layer:
+    x_domain_nm = (0.0, 100.0)
+    period_nm = x_domain_nm[1] - x_domain_nm[0]
+
+    def eps_fn(x_nm: jnp.ndarray) -> jnp.ndarray:
+        theta = 2 * jnp.pi * x_nm / period_nm
+        eps_xx = (
+            2.5
+            + 0.2 * jnp.cos(theta)
+            + 0.12 * jnp.sin(3 * theta)
+            + 0.08 * jnp.cos(5 * theta)
+        )
+        eps_yy = 1.8 + 0.05 * jnp.cos(2 * theta)
+        eps_zz = 2.2 + 0.03 * jnp.sin(theta)
+        zeros = jnp.zeros_like(theta)
+
+        return jnp.stack(
+            [
+                jnp.stack([eps_xx, zeros, zeros], axis=-1),
+                jnp.stack([zeros, eps_yy, zeros], axis=-1),
+                jnp.stack([zeros, zeros, eps_zz], axis=-1),
+            ],
+            axis=-2,
+        )
+
+    return Layer(thickness_nm=10.0, x_domain_nm=x_domain_nm, eps_fn=eps_fn)
+
+
 def test_layer_eps_folds_periodically() -> None:
     layer = Layer.piecewise(
         thickness_nm=10.0,
@@ -91,6 +132,23 @@ def test_toeplitz_matrices_match_manual_harmonic_difference_indexing() -> None:
         assert jnp.allclose(toeplitz[key], expected, atol=1e-12)
 
 
+def test_truncated_fourier_reconstruction_error_decreases_as_more_harmonics_are_kept() -> None:
+    layer = _smooth_diagonal_layer_with_known_spectrum()
+    num_points = 512
+    x_nm = layer.sample_points(num_points)
+    reference = layer.field_quantities(num_points=num_points)["hat_eps_xx"]
+
+    errors = []
+    for N in [1, 2, 3]:
+        coeffs = layer.fourier_coefficients(N, num_points=num_points)["hat_eps_xx"]
+        reconstruction = _reconstruct_from_centered_coeffs(coeffs, x_nm, layer.x_domain_nm)
+        rms_error = jnp.sqrt(jnp.mean(jnp.abs(reconstruction - reference) ** 2))
+        errors.append(float(rms_error))
+
+    assert errors[0] > errors[1] > errors[2]
+    assert errors[2] < 1e-12
+
+
 def test_stack_rejects_mismatched_periods() -> None:
     stack = Stack(wavelength_nm=405.0, kappa_inv_nm=0.0, eps_substrate=1.0, eps_superstrate=1.0)
     stack.add_layer(Layer.uniform(10.0, 2.0 * jnp.eye(3), x_domain_nm=(0.0, 100.0)))
@@ -119,3 +177,41 @@ def test_uniform_q_matrix_reorders_to_harmonic_block_diagonal_form(
 
     assert Q_component_major.shape == (4 * Stack.num_harmonics(N), 4 * Stack.num_harmonics(N))
     assert jnp.allclose(Q_harmonic_major, expected, atol=1e-12)
+
+
+def test_isotropic_q_matrix_matches_closed_form_uniform_medium_expression(
+    uniform_interface_stack: Stack,
+) -> None:
+    N = 2
+    num_h = Stack.num_harmonics(N)
+    eye = jnp.eye(num_h, dtype=jnp.complex128)
+    zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+
+    for eps, q_matrix in [
+        (
+            uniform_interface_stack.eps_substrate,
+            uniform_interface_stack.get_Q_substrate_normalized(N),
+        ),
+        (
+            uniform_interface_stack.eps_superstrate,
+            uniform_interface_stack.get_Q_superstrate_normalized(N),
+        ),
+    ]:
+        K_x = Layer.build_K_x_diag_matrix(
+            uniform_interface_stack.kappa_normalized,
+            uniform_interface_stack.G_normalized,
+            N,
+        )
+        K_x_squared = K_x @ K_x
+        expected_coupling = 1j * (K_x_squared - eps * eye)
+
+        expected = jnp.block(
+            [
+                [zero, zero, zero, -1j * eye],
+                [zero, zero, expected_coupling, zero],
+                [zero, -1j * eye, zero, zero],
+                [expected_coupling, zero, zero, zero],
+            ]
+        )
+
+        assert jnp.allclose(q_matrix, expected, atol=1e-12)

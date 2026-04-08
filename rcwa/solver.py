@@ -168,6 +168,20 @@ class Solver:
         """Diagonalize a full layer Q matrix and sort it into [forward, backward] modes."""
         eigenvalues, eigenvectors = jnp.linalg.eig(Q)
         eigenvectors = Solver._normalize_columns(eigenvectors)
+        half = Q.shape[0] // 2
+        eigvals = [complex(v) for v in eigenvalues]
+
+        def _pair_backward_indices(forward_idx: list[int], backward_idx: list[int]) -> list[int]:
+            paired_backward_idx: list[int] = []
+            remaining_backward_idx = backward_idx.copy()
+            for idx in forward_idx:
+                match = min(
+                    remaining_backward_idx,
+                    key=lambda j: abs(eigvals[idx] + eigvals[j]),
+                )
+                paired_backward_idx.append(match)
+                remaining_backward_idx.remove(match)
+            return paired_backward_idx
 
         direction_metric = jnp.where(
             jnp.abs(jnp.imag(eigenvalues)) > tol,
@@ -177,10 +191,13 @@ class Solver:
 
         if reference_fields is None:
             sort_idx = jnp.argsort(-direction_metric)
+            forward_idx = [int(i) for i in sort_idx[:half]]
+            backward_idx = [int(i) for i in sort_idx[half:]]
+            paired_backward_idx = _pair_backward_indices(forward_idx, backward_idx)
+            sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
             return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
         ref_coeffs = jnp.linalg.solve(reference_fields, eigenvectors)
-        half = Q.shape[0] // 2
         forward_weight = jnp.linalg.norm(ref_coeffs[:half, :], axis=0)
         backward_weight = jnp.linalg.norm(ref_coeffs[half:, :], axis=0)
         overlap_score = forward_weight - backward_weight
@@ -206,17 +223,18 @@ class Solver:
 
         if len(forward_idx) != half or len(backward_idx) != half:
             sort_idx = jnp.argsort(-direction_metric)
+            forward_idx = [int(i) for i in sort_idx[:half]]
+            backward_idx = [int(i) for i in sort_idx[half:]]
+            paired_backward_idx = _pair_backward_indices(forward_idx, backward_idx)
+            sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
             return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
         forward_idx.sort(
             key=lambda i: (float(overlap_score[i]), float(direction_metric[i])),
             reverse=True,
         )
-        backward_idx.sort(
-            key=lambda i: (float(-overlap_score[i]), float(-direction_metric[i])),
-            reverse=True,
-        )
-        sort_idx = jnp.array(forward_idx + backward_idx, dtype=jnp.int32)
+        paired_backward_idx = _pair_backward_indices(forward_idx, backward_idx)
+        sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
         return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
     @staticmethod
@@ -281,9 +299,10 @@ class Solver:
             raise ValueError(f"Expected an even number of eigenvalues, got shape[0]={n}.")
 
         half = n // 2
-        X = jnp.diag(jnp.exp(eigenvalues[:half] * thickness))
-        Z = jnp.zeros_like(X)
-        return Z, X, X, Z
+        X_forward = jnp.diag(jnp.exp(eigenvalues[:half] * thickness))
+        X_backward = jnp.diag(jnp.exp(-eigenvalues[half:] * thickness))
+        Z = jnp.zeros_like(X_forward)
+        return Z, X_forward, X_backward, Z
 
     @staticmethod
     def redheffer_star_product(Sa: ScatteringMatrix, Sb: ScatteringMatrix) -> ScatteringMatrix:
