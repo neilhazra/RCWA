@@ -102,6 +102,41 @@ def _rotated_in_plane_birefringent_eps(no: float, ne: float, theta_rad: float) -
     return _rotate_in_plane_eps(eps_local, theta_rad)
 
 
+def _uniform_anisotropic_layer_q_and_reference_fields(
+    N: int,
+    num_points: int = 256,
+) -> tuple[Stack, jnp.ndarray, jnp.ndarray]:
+    wavelength_nm = 633.0
+    period_nm = 500.0
+    kappa_inv_nm = 0.002
+    theta_rad = jnp.deg2rad(27.0)
+    eps_local = jnp.diag(jnp.array([2.05**2, 1.52**2, 1.67**2], dtype=jnp.complex128))
+    eps_tensor = _rotate_in_plane_eps(eps_local, theta_rad)
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=kappa_inv_nm,
+        eps_substrate=1.0,
+        eps_superstrate=1.0,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm=120.0,
+            eps_tensor=eps_tensor,
+            x_domain_nm=(0.0, period_nm),
+        )
+    )
+
+    q_matrix = Solver.component_to_harmonic_major(
+        stack.layer_Q_matrix_normalized(0, N, num_points=num_points)
+    )
+    substrate_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_substrate_normalized(N, num_points=num_points),
+        N,
+    )
+    return stack, q_matrix, substrate_fields
+
+
 def _zero_order_outgoing_electric_components(
     stack: Stack,
     modal_coeffs: jnp.ndarray,
@@ -304,6 +339,11 @@ def test_layer_mode_sort_uses_overlap_to_break_zeroed_direction_metric_ties(
     def fake_eig(_: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         return eigenvalues.copy(), eigenvectors.copy()
 
+    monkeypatch.setattr(
+        Solver,
+        "_harmonic_diag_blocks_if_block_diagonal",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(scipy.linalg, "eig", fake_eig)
 
     # In the reference basis, columns 0 and 2 are forward-like while columns 1
@@ -328,6 +368,92 @@ def test_layer_mode_sort_uses_overlap_to_break_zeroed_direction_metric_ties(
 
     expected = jnp.eye(4, dtype=jnp.complex128)[:, [0, 2, 1, 3]]
     assert jnp.array_equal(sorted_vectors, expected)
+
+
+def test_diagonalize_sort_layer_modes_uses_harmonic_block_fast_path_for_uniform_anisotropic_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, q_matrix, substrate_fields = _uniform_anisotropic_layer_q_and_reference_fields(N=2)
+
+    def fail_eig(_: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        raise AssertionError("dense scipy.linalg.eig should not be called for a harmonic block-diagonal layer")
+
+    monkeypatch.setattr(scipy.linalg, "eig", fail_eig)
+
+    eigenvalues, eigenvectors = Solver.diagonalize_sort_layer_modes(
+        q_matrix,
+        reference_fields=substrate_fields,
+    )
+    reconstructed = eigenvectors @ jnp.diag(eigenvalues) @ jnp.linalg.inv(eigenvectors)
+
+    assert jnp.allclose(reconstructed, q_matrix, atol=1e-8)
+
+
+def test_diagonalize_sort_layer_modes_uses_dense_fallback_for_patterned_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = Stack(
+        wavelength_nm=633.0,
+        kappa_inv_nm=0.0,
+        eps_substrate=1.0,
+        eps_superstrate=1.0,
+    )
+    stack.add_layer(
+        Layer.piecewise(
+            thickness_nm=120.0,
+            x_domain_nm=(0.0, 500.0),
+            segments=[
+                (0.0, 180.0, 2.4 * jnp.eye(3, dtype=jnp.complex128)),
+                (180.0, 500.0, 1.2 * jnp.eye(3, dtype=jnp.complex128)),
+            ],
+        )
+    )
+
+    N = 2
+    num_points = 256
+    q_matrix = Solver.component_to_harmonic_major(
+        stack.layer_Q_matrix_normalized(0, N, num_points=num_points)
+    )
+    substrate_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_substrate_normalized(N, num_points=num_points),
+        N,
+    )
+
+    original_eig = scipy.linalg.eig
+    calls = {"count": 0}
+
+    def tracking_eig(matrix: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        calls["count"] += 1
+        return original_eig(matrix)
+
+    monkeypatch.setattr(scipy.linalg, "eig", tracking_eig)
+
+    eigenvalues, eigenvectors = Solver.diagonalize_sort_layer_modes(
+        q_matrix,
+        reference_fields=substrate_fields,
+    )
+    reconstructed = eigenvectors @ jnp.diag(eigenvalues) @ jnp.linalg.inv(eigenvectors)
+
+    assert calls["count"] == 1
+    assert jnp.allclose(reconstructed, q_matrix, atol=1e-8)
+
+
+def test_uniform_anisotropic_layer_total_scattering_matches_dense_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack, _, _ = _uniform_anisotropic_layer_q_and_reference_fields(N=2)
+
+    fast = Solver.total_scattering_matrix(stack, 2, num_points=256)
+
+    monkeypatch.setattr(
+        Solver,
+        "_harmonic_diag_blocks_if_block_diagonal",
+        lambda *_args, **_kwargs: None,
+    )
+    dense = Solver.total_scattering_matrix(stack, 2, num_points=256)
+
+    for fast_block, dense_block in zip(fast, dense):
+        assert jnp.allclose(fast_block, dense_block, atol=1e-10)
 
 
 def test_modes_to_fields_matrix_reorders_columns_into_solver_modal_layout() -> None:
@@ -574,6 +700,7 @@ def test_verbose_total_scattering_matrix_emits_progress_messages(
 
     assert "[Solver] Building total scattering matrix" in captured.out
     assert "[Solver] Diagonalizing isotropic substrate modes" in captured.out
+    assert "block-diagonal harmonic layer Q" in captured.out
     assert "[Solver] Concatenating" in captured.out
 
 

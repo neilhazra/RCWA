@@ -101,6 +101,103 @@ class Solver:
         return jnp.moveaxis(diag_blocks, -1, 0)
 
     @staticmethod
+    def _harmonic_diag_blocks_if_block_diagonal(
+        Q: jnp.ndarray,
+        tol: float,
+    ) -> jnp.ndarray | None:
+        """Return per-harmonic 4x4 blocks when a layer Q is harmonic-block diagonal.
+
+        ``diagonalize_sort_layer_modes()`` receives layer operators in
+        harmonic-major ordering, so rows/columns are grouped as
+
+            [-H_y(n), H_x(n), E_y(n), D_x(n)]
+
+        for one harmonic ``n`` at a time. A spatially homogeneous layer has no
+        harmonic coupling, so in this basis the full Q matrix is block diagonal
+        with independent 4x4 blocks along the harmonic axis.
+        """
+        if Q.ndim != 2:
+            raise ValueError(
+                "Expected layer Q data with ndim 2, "
+                f"got ndim={Q.ndim} and shape={Q.shape}."
+            )
+        if Q.shape[0] != Q.shape[1]:
+            raise ValueError(f"Expected a square Q matrix, got shape={Q.shape}.")
+        if Q.shape[0] % 4 != 0:
+            raise ValueError(
+                "Expected a layer Q matrix with size divisible by 4, "
+                f"got shape={Q.shape}."
+            )
+
+        num_h = Q.shape[0] // 4
+        q_blocks = Q.reshape(num_h, 4, num_h, 4)
+        harmonic_blocks = q_blocks.transpose(0, 2, 1, 3)
+        block_idx = jnp.arange(num_h)
+        diag_blocks = harmonic_blocks[block_idx, block_idx]
+
+        if num_h == 1:
+            return diag_blocks
+
+        offdiag_mask = jnp.ones((num_h, num_h), dtype=bool)
+        offdiag_mask[block_idx, block_idx] = False
+        max_abs_q = float(jnp.max(jnp.abs(Q)))
+        max_offdiag = float(jnp.max(jnp.abs(harmonic_blocks[offdiag_mask])))
+
+        if max_offdiag <= tol * max(1.0, max_abs_q):
+            return diag_blocks
+        return None
+
+    @staticmethod
+    def _block_diagonal_matrix(blocks: jnp.ndarray) -> jnp.ndarray:
+        """Assemble a dense block-diagonal matrix from blocks[block, row, col]."""
+        num_blocks, block_size, _ = blocks.shape
+        out = jnp.zeros((num_blocks * block_size, num_blocks * block_size), dtype=blocks.dtype)
+        for i in range(num_blocks):
+            row_slice = slice(i * block_size, (i + 1) * block_size)
+            out[row_slice, row_slice] = blocks[i]
+        return out
+
+    @staticmethod
+    def _sort_layer_eigensystem(
+        eigenvalues: jnp.ndarray,
+        eigenvectors: jnp.ndarray,
+        reference_fields: jnp.ndarray | None,
+        tol: float,
+        verbose: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Sort layer modes into the solver-wide [all forward, all backward] convention."""
+        eigenvectors = Solver._normalize_columns(eigenvectors)
+        direction_metric = jnp.where(
+            jnp.abs(jnp.imag(eigenvalues)) > tol,
+            jnp.imag(eigenvalues),
+            -jnp.real(eigenvalues),
+        )
+
+        if reference_fields is None:
+            sort_idx = jnp.argsort(-direction_metric)
+            Solver._log(verbose, "Finished direction-metric sorting without reference-basis overlap")
+            return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
+
+        Solver._log(verbose, "Computing reference-basis overlaps for layer mode sorting")
+        ref_coeffs = jnp.linalg.solve(reference_fields, eigenvectors)
+        half = eigenvectors.shape[0] // 2
+        forward_weight = jnp.linalg.norm(ref_coeffs[:half, :], axis=0)
+        backward_weight = jnp.linalg.norm(ref_coeffs[half:, :], axis=0)
+        overlap_score = forward_weight - backward_weight
+        direction_metric_for_sort = jnp.where(
+            jnp.abs(direction_metric) > tol,
+            direction_metric,
+            0.0,
+        )
+
+        # numpy.lexsort uses the last key as the primary key. This sorts first
+        # by descending direction metric and then uses reference-basis overlap
+        # to break ties for numerically ambiguous directions.
+        sort_idx = jnp.lexsort((-overlap_score, -direction_metric_for_sort))
+        Solver._log(verbose, "Finished lexicographic forward/backward sorting with overlap tie-break")
+        return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
+
+    @staticmethod
     def _normalize_columns(vectors: jnp.ndarray, tol: float = 1e-14) -> jnp.ndarray:
         norms = jnp.linalg.norm(vectors, axis=-2, keepdims=True)
         safe_norms = jnp.where(norms > tol, norms, 1.0)
@@ -187,32 +284,43 @@ class Solver:
         tol: float = 1e-9,
         verbose: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Diagonalize a full layer Q matrix and sort it into [forward, backward] modes."""
-        Solver._log(verbose, f"Starting scipy.linalg.eig for layer matrix with shape {Q.shape}")
-        eigenvalues, eigenvectors = scipy.linalg.eig(Q)
-        Solver._log(verbose, "Finished scipy.linalg.eig; normalizing layer eigenvectors")
-        eigenvectors = Solver._normalize_columns(eigenvectors)
-        half = Q.shape[0] // 2
-        Solver._log(verbose, "Starting layer mode direction classification and sorting")
-        direction_metric = jnp.where(
-            jnp.abs(jnp.imag(eigenvalues)) > tol,
-            jnp.imag(eigenvalues),
-            -jnp.real(eigenvalues),
-        )
-        Solver._log(verbose, "Computing reference-basis overlaps for layer mode sorting")
-        ref_coeffs = jnp.linalg.solve(reference_fields, eigenvectors)
-        forward_weight = jnp.linalg.norm(ref_coeffs[:half, :], axis=0)
-        backward_weight = jnp.linalg.norm(ref_coeffs[half:, :], axis=0)
-        overlap_score = forward_weight - backward_weight
-        direction_metric_for_sort = jnp.where(
-            jnp.abs(direction_metric) > tol,
-            direction_metric,
-            0.0,
-        )
-        sort_idx = jnp.lexsort((-overlap_score, -direction_metric_for_sort))
-        Solver._log(verbose, "Finished lexicographic forward/backward sorting with overlap tie-break")
-        return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
+        """Diagonalize a full layer Q matrix in harmonic-major basis.
 
+        The input ``Q`` is in harmonic-major ordering, so a spatially uniform
+        layer appears as a block-diagonal matrix with one independent 4x4 block
+        per harmonic. In that case we avoid a full dense eigendecomposition and
+        diagonalize the 4x4 blocks directly before reconstructing the full
+        eigensystem. Both the fast path and the dense fallback are then sorted
+        into the solver-wide modal ordering whose first half contains all
+        forward/right-going modes and whose second half contains all
+        backward/left-going modes.
+        """
+        diag_blocks = Solver._harmonic_diag_blocks_if_block_diagonal(Q, tol=tol)
+        if diag_blocks is not None:
+            Solver._log(
+                verbose,
+                (
+                    "Detected block-diagonal harmonic layer Q; using per-harmonic "
+                    "4x4 fast path with numpy.linalg.eig"
+                ),
+            )
+            block_eigenvalues, block_eigenvectors = jnp.linalg.eig(diag_blocks)
+            eigenvalues = block_eigenvalues.reshape(-1)
+            eigenvectors = Solver._block_diagonal_matrix(block_eigenvectors)
+            Solver._log(verbose, "Finished harmonic block fast path; normalizing layer eigenvectors")
+        else:
+            Solver._log(verbose, f"Starting dense scipy.linalg.eig fallback for layer matrix with shape {Q.shape}")
+            eigenvalues, eigenvectors = scipy.linalg.eig(Q)
+            Solver._log(verbose, "Finished scipy.linalg.eig; normalizing layer eigenvectors")
+
+        Solver._log(verbose, "Starting layer mode direction classification and sorting")
+        return Solver._sort_layer_eigensystem(
+            eigenvalues,
+            eigenvectors,
+            reference_fields=reference_fields,
+            tol=tol,
+            verbose=verbose,
+        )
 
     @staticmethod
     def basis_change_transfer_matrix(left_fields: jnp.ndarray, right_fields: jnp.ndarray) -> jnp.ndarray:
