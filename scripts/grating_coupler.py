@@ -20,16 +20,16 @@ n_wg = 2.0
 n_sub = 1.0
 n_sup = 1.0
 local_grating_period_nm = 399.8
-supercell_period_nm = 30_000.0
-grating_length_nm = 6_000.0
+supercell_period_nm = 7_000.0
+grating_length_nm = 2_980.0
 d_slab_nm = 120.0
 d_grating_nm = 60.0
 duty_cycle = 0.5
 design_wl_nm = 633.0
 sweep_half_span_nm = 40.0
 sweep_num_samples = 81
-geometry_fourier_order = 256
-default_geometry_num_points = 8192
+geometry_fourier_order = 2048*4
+default_geometry_num_points = 4096*8
 default_num_points = 1024
 default_design_N = 16
 default_sweep_N = 12
@@ -432,7 +432,7 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     plot_geometry()
-    run_design_point_demo()
+    #run_design_point_demo()
     #plot_wavelength_sweep()
     plt.show()
 
