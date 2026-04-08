@@ -163,6 +163,40 @@ def _assert_modal_propagation_pairing(
     assert jnp.allclose(S21, expected_backward, atol=atol)
 
 
+def _explicit_transfer_to_scattering(T: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    half = T.shape[0] // 2
+    T11 = T[:half, :half]
+    T12 = T[:half, half:]
+    T21 = T[half:, :half]
+    T22 = T[half:, half:]
+    T22_inv = jnp.linalg.inv(T22)
+    return (
+        -(T22_inv @ T21),
+        T22_inv,
+        T11 - T12 @ T22_inv @ T21,
+        T12 @ T22_inv,
+    )
+
+
+def _explicit_redheffer_star_product(
+    Sa: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    Sb: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    A11, A12, A21, A22 = Sa
+    B11, B12, B21, B22 = Sb
+    half = A11.shape[0]
+    I = jnp.eye(half, dtype=A11.dtype)
+
+    inv_a = jnp.linalg.solve(I - A22 @ B11, I)
+    inv_b = jnp.linalg.solve(I - B11 @ A22, I)
+    return (
+        A11 + A12 @ inv_b @ B11 @ A21,
+        A12 @ inv_b @ B12,
+        B21 @ inv_a @ A21,
+        B22 + B21 @ inv_a @ A22 @ B12,
+    )
+
+
 def test_reorder_matrix_layout() -> None:
     N = 2
     num_h = Stack.num_harmonics(N)
@@ -173,6 +207,16 @@ def test_reorder_matrix_layout() -> None:
     for h in range(num_h):
         for p in range(4):
             assert jnp.isclose(out[4 * h + p], vec[p * num_h + h])
+
+
+def test_component_to_harmonic_major_matches_reorder_similarity_transform() -> None:
+    N = 2
+    num_h = Stack.num_harmonics(N)
+    matrix = jnp.arange((4 * num_h) ** 2, dtype=jnp.complex128).reshape(4 * num_h, 4 * num_h)
+    reorder = Solver.reorder_matrix(N)
+    expected = reorder @ matrix @ reorder.T
+
+    assert jnp.array_equal(Solver.component_to_harmonic_major(matrix), expected)
 
 
 def test_mode_reorder_indices_put_all_forward_modes_before_backward_modes() -> None:
@@ -211,6 +255,23 @@ def test_diagonalize_sort_isotropic_modes_reconstructs_blocks(uniform_interface_
         for h in range(evals.shape[0]):
             Q_recon = evecs[h] @ jnp.diag(evals[h]) @ jnp.linalg.inv(evecs[h])
             assert jnp.allclose(Q_recon, diag_blocks[h], atol=1e-8)
+
+
+def test_diagonalize_sort_isotropic_modes_accepts_preextracted_harmonic_blocks(
+    uniform_interface_stack: Stack,
+) -> None:
+    N = 2
+    Q_iso = uniform_interface_stack.get_Q_substrate_normalized(N)
+    diag_blocks = Solver._isotropic_diag_blocks(Q_iso)
+
+    evals, evecs = Solver.diagonalize_sort_isotropic_modes(diag_blocks)
+
+    assert evals.shape == (Stack.num_harmonics(N), 4)
+    assert evecs.shape == (Stack.num_harmonics(N), 4, 4)
+
+    for h in range(evals.shape[0]):
+        reconstructed = evecs[h] @ jnp.diag(evals[h]) @ jnp.linalg.inv(evecs[h])
+        assert jnp.allclose(reconstructed, diag_blocks[h], atol=1e-8)
 
 
 def test_isotropic_mode_fields_have_global_forward_backward_split(
@@ -264,6 +325,32 @@ def test_transfer_to_scattering_identity_is_identity() -> None:
     assert jnp.allclose(S22, 0, atol=1e-12)
     assert jnp.allclose(S12, eye, atol=1e-12)
     assert jnp.allclose(S21, eye, atol=1e-12)
+
+
+def test_transfer_to_scattering_matches_explicit_block_formula_for_generic_transfer_matrix() -> None:
+    T11 = jnp.array(
+        [[1.3 + 0.2j, -0.4 + 0.1j], [0.15 - 0.3j, 0.8 + 0.05j]],
+        dtype=jnp.complex128,
+    )
+    T12 = jnp.array(
+        [[0.2 - 0.1j, 0.05 + 0.03j], [-0.1 + 0.2j, 0.4 - 0.15j]],
+        dtype=jnp.complex128,
+    )
+    T21 = jnp.array(
+        [[-0.3 + 0.2j, 0.07 - 0.05j], [0.12 + 0.09j, -0.18 + 0.04j]],
+        dtype=jnp.complex128,
+    )
+    T22 = jnp.array(
+        [[1.6 - 0.4j, 0.2 + 0.1j], [-0.25 + 0.05j, 1.2 + 0.3j]],
+        dtype=jnp.complex128,
+    )
+    T = jnp.block([[T11, T12], [T21, T22]])
+
+    expected = _explicit_transfer_to_scattering(T)
+    actual = Solver.transfer_to_scattering(T)
+
+    for expected_block, actual_block in zip(expected, actual):
+        assert jnp.allclose(actual_block, expected_block, atol=1e-12)
 
 
 def test_modal_propagation_scattering_matrix_is_reflectionless() -> None:
@@ -391,6 +478,17 @@ def test_modal_propagation_scattering_matrix_matches_backward_half_for_off_norma
     )
 
 
+def test_pair_backward_indices_matches_nearest_opposite_eigenvalue_greedy_rule() -> None:
+    eigenvalues = jnp.array(
+        [0.42 + 0.10j, 0.83 + 0.25j, -0.81 - 0.23j, -0.40 - 0.09j],
+        dtype=jnp.complex128,
+    )
+
+    paired = Solver._pair_backward_indices(eigenvalues, forward_idx=[0, 1], backward_idx=[2, 3])
+
+    assert paired == [3, 2]
+
+
 def test_redheffer_star_product_multiplies_reflectionless_transmissions() -> None:
     X1 = jnp.diag(jnp.array([0.8 + 0.1j, 0.7 - 0.2j], dtype=jnp.complex128))
     X2 = jnp.diag(jnp.array([0.9 - 0.05j, 0.6 + 0.15j], dtype=jnp.complex128))
@@ -406,6 +504,27 @@ def test_redheffer_star_product_multiplies_reflectionless_transmissions() -> Non
     assert jnp.allclose(S21, expected, atol=1e-12)
 
 
+def test_redheffer_star_product_matches_explicit_two_solve_formula_for_generic_blocks() -> None:
+    Sa = (
+        jnp.array([[0.12 + 0.04j, -0.03 + 0.01j], [0.02 - 0.05j, 0.15 + 0.02j]], dtype=jnp.complex128),
+        jnp.array([[0.81 - 0.02j, 0.05 + 0.03j], [-0.04 + 0.01j, 0.78 + 0.06j]], dtype=jnp.complex128),
+        jnp.array([[0.76 + 0.01j, -0.02 + 0.04j], [0.03 - 0.01j, 0.83 - 0.02j]], dtype=jnp.complex128),
+        jnp.array([[0.08 + 0.03j, 0.01 - 0.02j], [-0.02 + 0.01j, 0.09 + 0.04j]], dtype=jnp.complex128),
+    )
+    Sb = (
+        jnp.array([[0.11 - 0.02j, 0.04 + 0.01j], [-0.01 + 0.02j, 0.07 - 0.03j]], dtype=jnp.complex128),
+        jnp.array([[0.79 + 0.05j, -0.03 + 0.02j], [0.02 + 0.01j, 0.75 - 0.04j]], dtype=jnp.complex128),
+        jnp.array([[0.82 - 0.01j, 0.01 + 0.03j], [-0.02 + 0.02j, 0.77 + 0.05j]], dtype=jnp.complex128),
+        jnp.array([[0.06 + 0.02j, -0.01 + 0.01j], [0.02 - 0.03j, 0.10 + 0.01j]], dtype=jnp.complex128),
+    )
+
+    expected = _explicit_redheffer_star_product(Sa, Sb)
+    actual = Solver.redheffer_star_product(Sa, Sb)
+
+    for expected_block, actual_block in zip(expected, actual):
+        assert jnp.allclose(actual_block, expected_block, atol=1e-12)
+
+
 def test_uniform_interface_total_scattering_is_finite_and_diagonal(
     uniform_interface_stack: Stack,
 ) -> None:
@@ -415,6 +534,18 @@ def test_uniform_interface_total_scattering_is_finite_and_diagonal(
         assert jnp.all(jnp.isfinite(S21))
         assert jnp.max(jnp.abs(S11 - jnp.diag(jnp.diag(S11)))) < 1e-10
         assert jnp.max(jnp.abs(S21 - jnp.diag(jnp.diag(S21)))) < 1e-10
+
+
+def test_verbose_total_scattering_matrix_emits_progress_messages(
+    uniform_interface_stack: Stack,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    Solver.total_scattering_matrix(uniform_interface_stack, 1, num_points=128, verbose=True)
+    captured = capsys.readouterr()
+
+    assert "[Solver] Building total scattering matrix" in captured.out
+    assert "[Solver] Diagonalizing isotropic substrate modes" in captured.out
+    assert "[Solver] Concatenating" in captured.out
 
 
 def test_reflection_transmission_only_populates_zero_order_for_uniform_interface(

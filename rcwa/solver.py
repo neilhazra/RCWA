@@ -102,9 +102,60 @@ class Solver:
 
     @staticmethod
     def _normalize_columns(vectors: jnp.ndarray, tol: float = 1e-14) -> jnp.ndarray:
-        norms = jnp.linalg.norm(vectors, axis=0, keepdims=True)
+        norms = jnp.linalg.norm(vectors, axis=-2, keepdims=True)
         safe_norms = jnp.where(norms > tol, norms, 1.0)
         return vectors / safe_norms
+
+    @staticmethod
+    def _resolve_isotropic_pair(
+        v1: jnp.ndarray,
+        v2: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Resolve a degenerate isotropic mode pair into a stable TE/TM basis.
+
+        The inputs may be a single pair with shape ``(4,)`` or a batched set of
+        pairs with shape ``(..., 4)``.
+        """
+        w_te = v2[..., 3, None] * v1 - v1[..., 3, None] * v2
+        w_tm = v2[..., 2, None] * v1 - v1[..., 2, None] * v2
+        pair = jnp.stack([w_te, w_tm], axis=-1)
+        pair = Solver._normalize_columns(pair)
+
+        fallback = Solver._normalize_columns(jnp.stack([v1, v2], axis=-1))
+        valid = jnp.linalg.norm(jnp.stack([w_te, w_tm], axis=-1), axis=-2) > 1e-14
+        te = jnp.where(valid[..., 0, None], pair[..., 0], fallback[..., 0])
+        tm = jnp.where(valid[..., 1, None], pair[..., 1], fallback[..., 1])
+        return te, tm
+
+    @staticmethod
+    def _pair_backward_indices(
+        eigenvalues: jnp.ndarray,
+        forward_idx: list[int],
+        backward_idx: list[int],
+    ) -> list[int]:
+        """Greedily pair each forward mode with the nearest opposite eigenvalue."""
+        if len(forward_idx) != len(backward_idx):
+            raise ValueError(
+                "Forward and backward mode lists must have the same length, "
+                f"got {len(forward_idx)} and {len(backward_idx)}."
+            )
+        if not forward_idx:
+            return []
+
+        forward_idx_array = jnp.asarray(forward_idx, dtype=jnp.int32)
+        backward_idx_array = jnp.asarray(backward_idx, dtype=jnp.int32)
+        pair_costs = jnp.abs(
+            eigenvalues[forward_idx_array][:, None] + eigenvalues[backward_idx_array][None, :]
+        )
+
+        available = jnp.ones(backward_idx_array.shape[0], dtype=bool)
+        paired_backward_idx: list[int] = []
+        for row in range(len(forward_idx)):
+            masked_costs = jnp.where(available, pair_costs[row], jnp.inf)
+            col = int(jnp.argmin(masked_costs))
+            paired_backward_idx.append(int(backward_idx_array[col]))
+            available[col] = False
+        return paired_backward_idx
 
     def diagonalize_sort_isotropic_modes(Q_iso: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Diagonalize isotropic half-space modes harmonic-by-harmonic.
@@ -119,44 +170,21 @@ class Solver:
         """
         diag_blocks = Solver._isotropic_diag_blocks(Q_iso)
 
-        def _resolve_pair(v1: jnp.ndarray, v2: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            # In an isotropic medium the forward and backward pairs are often
-            # polarization-degenerate. Recombine each pair into a stable TE/TM
-            # basis by constructing one vector with vanishing D_x and one with
-            # vanishing E_y in the reduced field basis [-H_y, H_x, E_y, D_x]^T.
-            w_te = v2[3] * v1 - v1[3] * v2
-            w_tm = v2[2] * v1 - v1[2] * v2
-            pair = jnp.column_stack([w_te, w_tm])
-            pair = Solver._normalize_columns(pair)
+        eigenvalues, eigenvectors = jnp.linalg.eig(diag_blocks)
+        tol = 1e-8
+        direction_metric = jnp.where(
+            jnp.abs(jnp.imag(eigenvalues)) > tol,
+            jnp.imag(eigenvalues),
+            -jnp.real(eigenvalues),
+        )
+        sort_idx = jnp.argsort(-direction_metric, axis=1)
+        eigenvalues = jnp.take_along_axis(eigenvalues, sort_idx, axis=1)
+        eigenvectors = jnp.take_along_axis(eigenvectors, sort_idx[:, None, :], axis=2)
 
-            fallback = Solver._normalize_columns(jnp.column_stack([v1, v2]))
-            valid = jnp.linalg.norm(jnp.column_stack([w_te, w_tm]), axis=0) > 1e-14
-            return (
-                jnp.where(valid[0], pair[:, 0], fallback[:, 0]),
-                jnp.where(valid[1], pair[:, 1], fallback[:, 1]),
-            )
-
-        def _eig_sort_single(block: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            eigenvalues, eigenvectors = jnp.linalg.eig(block)
-            tol = 1e-8
-            direction_metric = jnp.where(
-                jnp.abs(jnp.imag(eigenvalues)) > tol,
-                jnp.imag(eigenvalues),
-                -jnp.real(eigenvalues),
-            )
-            sort_idx = jnp.argsort(-direction_metric)
-            eigenvalues = eigenvalues[sort_idx]
-            eigenvectors = eigenvectors[:, sort_idx]
-
-            te_fwd, tm_fwd = _resolve_pair(eigenvectors[:, 0], eigenvectors[:, 1])
-            te_bwd, tm_bwd = _resolve_pair(eigenvectors[:, 2], eigenvectors[:, 3])
-            eigenvectors = jnp.column_stack([te_fwd, tm_fwd, te_bwd, tm_bwd])
-            return eigenvalues, Solver._normalize_columns(eigenvectors)
-
-        mode_data = [_eig_sort_single(block) for block in diag_blocks]
-        eigenvalues = jnp.stack([vals for vals, _ in mode_data], axis=0)
-        eigenvectors = jnp.stack([vecs for _, vecs in mode_data], axis=0)
-        return eigenvalues, eigenvectors
+        te_fwd, tm_fwd = Solver._resolve_isotropic_pair(eigenvectors[:, :, 0], eigenvectors[:, :, 1])
+        te_bwd, tm_bwd = Solver._resolve_isotropic_pair(eigenvectors[:, :, 2], eigenvectors[:, :, 3])
+        eigenvectors = jnp.stack([te_fwd, tm_fwd, te_bwd, tm_bwd], axis=2)
+        return eigenvalues, Solver._normalize_columns(eigenvectors)
 
     @staticmethod
     def modes_to_fields_matrix(evecs: jnp.ndarray) -> jnp.ndarray:
@@ -187,25 +215,16 @@ class Solver:
         Q: jnp.ndarray,
         reference_fields: jnp.ndarray | None = None,
         tol: float = 1e-9,
+        verbose: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Diagonalize a full layer Q matrix and sort it into [forward, backward] modes."""
+        Solver._log(verbose, f"Starting scipy.linalg.eig for layer matrix with shape {Q.shape}")
         eigenvalues, eigenvectors = scipy.linalg.eig(Q)
+        Solver._log(verbose, "Finished scipy.linalg.eig; normalizing layer eigenvectors")
         eigenvectors = Solver._normalize_columns(eigenvectors)
         half = Q.shape[0] // 2
-        eigvals = [complex(v) for v in eigenvalues]
 
-        def _pair_backward_indices(forward_idx: list[int], backward_idx: list[int]) -> list[int]:
-            paired_backward_idx: list[int] = []
-            remaining_backward_idx = backward_idx.copy()
-            for idx in forward_idx:
-                match = min(
-                    remaining_backward_idx,
-                    key=lambda j: abs(eigvals[idx] + eigvals[j]),
-                )
-                paired_backward_idx.append(match)
-                remaining_backward_idx.remove(match)
-            return paired_backward_idx
-
+        Solver._log(verbose, "Starting layer mode direction classification and sorting")
         direction_metric = jnp.where(
             jnp.abs(jnp.imag(eigenvalues)) > tol,
             jnp.imag(eigenvalues),
@@ -213,13 +232,20 @@ class Solver:
         )
 
         if reference_fields is None:
+            Solver._log(verbose, "Sorting layer modes without reference-field overlap data")
             sort_idx = jnp.argsort(-direction_metric)
             forward_idx = [int(i) for i in sort_idx[:half]]
             backward_idx = [int(i) for i in sort_idx[half:]]
-            paired_backward_idx = _pair_backward_indices(forward_idx, backward_idx)
+            paired_backward_idx = Solver._pair_backward_indices(
+                eigenvalues,
+                forward_idx,
+                backward_idx,
+            )
+            Solver._log(verbose, "Finished greedy forward/backward mode pairing")
             sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
             return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
+        Solver._log(verbose, "Computing reference-basis overlaps for layer mode sorting")
         ref_coeffs = jnp.linalg.solve(reference_fields, eigenvectors)
         forward_weight = jnp.linalg.norm(ref_coeffs[:half, :], axis=0)
         backward_weight = jnp.linalg.norm(ref_coeffs[half:, :], axis=0)
@@ -245,10 +271,16 @@ class Solver:
             backward_idx.append(ambiguous_idx.pop(0))
 
         if len(forward_idx) != half or len(backward_idx) != half:
+            Solver._log(verbose, "Ambiguous direction split encountered; falling back to pure direction-metric sort")
             sort_idx = jnp.argsort(-direction_metric)
             forward_idx = [int(i) for i in sort_idx[:half]]
             backward_idx = [int(i) for i in sort_idx[half:]]
-            paired_backward_idx = _pair_backward_indices(forward_idx, backward_idx)
+            paired_backward_idx = Solver._pair_backward_indices(
+                eigenvalues,
+                forward_idx,
+                backward_idx,
+            )
+            Solver._log(verbose, "Finished greedy forward/backward mode pairing")
             sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
             return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
@@ -256,7 +288,12 @@ class Solver:
             key=lambda i: (float(overlap_score[i]), float(direction_metric[i])),
             reverse=True,
         )
-        paired_backward_idx = _pair_backward_indices(forward_idx, backward_idx)
+        paired_backward_idx = Solver._pair_backward_indices(
+            eigenvalues,
+            forward_idx,
+            backward_idx,
+        )
+        Solver._log(verbose, "Finished greedy forward/backward mode pairing")
         sort_idx = jnp.array(forward_idx + paired_backward_idx, dtype=jnp.int32)
         return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
@@ -274,8 +311,10 @@ class Solver:
         T21 = T[half:, :half]
         T22 = T[half:, half:]
 
-        T22_inv_T21 = jnp.linalg.solve(T22, T21)
-        T22_inv = jnp.linalg.solve(T22, jnp.eye(half, dtype=T22.dtype))
+        rhs = jnp.concatenate([T21, jnp.eye(half, dtype=T22.dtype)], axis=1)
+        solution = jnp.linalg.solve(T22, rhs)
+        T22_inv_T21 = solution[:, :half]
+        T22_inv = solution[:, half:]
 
         S11 = -T22_inv_T21
         S12 = T22_inv
@@ -307,9 +346,14 @@ class Solver:
     def layer_mode_fields(
         q_matrix: jnp.ndarray,
         reference_fields: jnp.ndarray,
+        verbose: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Return sorted layer eigenvalues and the corresponding fields matrix."""
-        return Solver.diagonalize_sort_layer_modes(q_matrix, reference_fields=reference_fields)
+        return Solver.diagonalize_sort_layer_modes(
+            q_matrix,
+            reference_fields=reference_fields,
+            verbose=verbose,
+        )
 
     @staticmethod
     def modal_propagation_scattering_matrix(
@@ -335,13 +379,21 @@ class Solver:
         half = A11.shape[0]
         I = jnp.eye(half, dtype=A11.dtype)
 
-        inv_a = jnp.linalg.solve(I - A22 @ B11, I)
-        inv_b = jnp.linalg.solve(I - B11 @ A22, I)
+        system = I - A22 @ B11
+        rhs = jnp.concatenate([A21, A22 @ B12], axis=1)
+        solution = jnp.linalg.solve(system, rhs)
+        inv_a_A21 = solution[:, :half]
+        inv_a_A22_B12 = solution[:, half:]
 
-        C11 = A11 + A12 @ inv_b @ B11 @ A21
-        C12 = A12 @ inv_b @ B12
-        C21 = B21 @ inv_a @ A21
-        C22 = B22 + B21 @ inv_a @ A22 @ B12
+        B11_inv_a_A21 = B11 @ inv_a_A21
+        B11_inv_a_A22_B12 = B11 @ inv_a_A22_B12
+        B21_inv_a_A21 = B21 @ inv_a_A21
+        B21_inv_a_A22_B12 = B21 @ inv_a_A22_B12
+
+        C11 = A11 + A12 @ B11_inv_a_A21
+        C12 = A12 @ (B12 + B11_inv_a_A22_B12)
+        C21 = B21_inv_a_A21
+        C22 = B22 + B21_inv_a_A22_B12
         return C11, C12, C21, C22
 
     @staticmethod
@@ -400,7 +452,7 @@ class Solver:
                 verbose,
                 f"Diagonalizing layer {i} Q matrix with shape {q_matrix.shape}",
             )
-            mode_data = Solver.layer_mode_fields(q_matrix, reference_fields)
+            mode_data = Solver.layer_mode_fields(q_matrix, reference_fields, verbose=verbose)
             layer_modes.append(mode_data)
             reference_fields = mode_data[1]
             Solver._log(
