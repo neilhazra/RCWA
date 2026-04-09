@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import pathlib
+import sys
+
 import numpy as jnp
 import pytest
 import scipy.linalg
 
 from rcwa import Layer, Solver, Stack
+
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "pyGTM"))
+GTM = pytest.importorskip("GTM.GTMcore")
 
 
 def _fresnel_interface(n1: complex, n2: complex) -> tuple[complex, complex]:
@@ -13,28 +20,82 @@ def _fresnel_interface(n1: complex, n2: complex) -> tuple[complex, complex]:
     return r, t
 
 
+def _forward_q(eps: complex, kappa_normalized: complex) -> complex:
+    q = jnp.sqrt(complex(eps) - complex(kappa_normalized) ** 2)
+    if jnp.imag(q) < 0.0 or (abs(jnp.imag(q)) < 1e-14 and jnp.real(q) < 0.0):
+        q = -q
+    return q
+
+
+def _physical_port_fields_matrix(stack: Stack, eps: complex, N: int) -> jnp.ndarray:
+    num_h = Stack.num_harmonics(N)
+    fields = jnp.zeros((4 * num_h, 4 * num_h), dtype=jnp.complex128)
+
+    for h, order in enumerate(Stack.harmonic_orders(N)):
+        kappa_normalized = stack.kappa_normalized + order * stack.G_normalized
+        q = _forward_q(eps, kappa_normalized)
+        block = jnp.stack(
+            [
+                jnp.array([0.0, -q, 1.0, 0.0], dtype=jnp.complex128),
+                jnp.array([eps / q, 0.0, 0.0, -1.0], dtype=jnp.complex128),
+                jnp.array([0.0, q, 1.0, 0.0], dtype=jnp.complex128),
+                jnp.array([eps / q, 0.0, 0.0, 1.0], dtype=jnp.complex128),
+            ],
+            axis=1,
+        )
+        fields[4 * h : 4 * (h + 1), 4 * h : 4 * (h + 1)] = block
+
+    return fields[:, Solver.mode_reorder_indices(N)]
+
+
 def _zero_order_field_rt(stack: Stack, N: int, pol: str, num_points: int = 256) -> tuple[complex, complex]:
-    r, t = Solver.reflection_transmission(stack, N, incident_pol=pol, num_points=num_points)
-    Q_sub = stack.get_Q_substrate_normalized(N, num_points=num_points)
-    Q_sup = stack.get_Q_superstrate_normalized(N, num_points=num_points)
-    _, evecs_sub = Solver.diagonalize_sort_isotropic_modes(Q_sub)
-    _, evecs_sup = Solver.diagonalize_sort_isotropic_modes(Q_sup)
-    h = Stack.zero_harmonic_index(N)
+    scattering_modal = Solver.total_scattering_matrix(
+        stack,
+        N,
+        num_points=num_points,
+        verbose=False,
+    )
+    substrate_reduced_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_substrate_normalized(N, num_points=num_points),
+        N,
+    )
+    superstrate_reduced_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_superstrate_normalized(N, num_points=num_points),
+        N,
+    )
+    substrate_tangential_fields = Solver.reduced_to_tangential_fields(
+        substrate_reduced_fields,
+        Solver.isotropic_reduced_to_tangential_transform_component_major(
+            stack.eps_substrate,
+            N,
+        ),
+    )
+    superstrate_tangential_fields = Solver.reduced_to_tangential_fields(
+        superstrate_reduced_fields,
+        Solver.isotropic_reduced_to_tangential_transform_component_major(
+            stack.eps_superstrate,
+            N,
+        ),
+    )
+    substrate_physical_fields = _physical_port_fields_matrix(stack, stack.eps_substrate, N)
+    superstrate_physical_fields = _physical_port_fields_matrix(stack, stack.eps_superstrate, N)
 
-    if pol == "TE":
-        E_sub_fwd = evecs_sub[h, 2, 0]
-        E_sub_bwd = evecs_sub[h, 2, 2]
-        E_sup_fwd = evecs_sup[h, 2, 0]
-        zero_mode = Solver.zero_order_mode_index(N, "TE")
-    else:
-        E_sub_fwd = evecs_sub[h, 3, 1]
-        E_sub_bwd = evecs_sub[h, 3, 3]
-        E_sup_fwd = evecs_sup[h, 3, 1]
-        zero_mode = Solver.zero_order_mode_index(N, "TM")
+    scattering_physical = Solver.chain_scattering_matrices(
+        [
+            Solver.basis_change_scattering_matrix(
+                substrate_physical_fields,
+                substrate_tangential_fields,
+            ),
+            scattering_modal,
+            Solver.basis_change_scattering_matrix(
+                superstrate_tangential_fields,
+                superstrate_physical_fields,
+            ),
+        ]
+    )
 
-    r0 = r[zero_mode] * (E_sub_bwd / E_sub_fwd)
-    t0 = t[zero_mode] * (E_sup_fwd / E_sub_fwd)
-    return r0, t0
+    zero_mode = Solver.zero_order_mode_index(N, pol)
+    return scattering_physical[0][zero_mode, zero_mode], scattering_physical[2][zero_mode, zero_mode]
 
 
 def _normal_incidence_characteristic_rt(
@@ -100,6 +161,105 @@ def _rotate_in_plane_eps(eps_local: jnp.ndarray, theta_rad: float) -> jnp.ndarra
 def _rotated_in_plane_birefringent_eps(no: float, ne: float, theta_rad: float) -> jnp.ndarray:
     eps_local = jnp.diag(jnp.array([no**2, ne**2, 1.0], dtype=jnp.complex128))
     return _rotate_in_plane_eps(eps_local, theta_rad)
+
+
+def _const_eps_fn(value: complex):
+    return lambda frequency_hz, _value=complex(value): _value
+
+
+def _pygtm_rpp(
+    wavelength_nm: float,
+    zeta: complex,
+    eps_incident: complex,
+    eps_exit: complex,
+    layers: list[tuple[float, jnp.ndarray, float]],
+) -> complex:
+    system = GTM.System()
+    system.set_superstrate(GTM.Layer(epsilon1=_const_eps_fn(eps_incident)))
+    system.set_substrate(GTM.Layer(epsilon1=_const_eps_fn(eps_exit)))
+
+    for thickness_nm, eps_local, angle_deg in layers:
+        system.add_layer(
+            GTM.Layer(
+                thickness=thickness_nm * 1e-9,
+                epsilon1=_const_eps_fn(eps_local[0, 0]),
+                epsilon2=_const_eps_fn(eps_local[1, 1]),
+                epsilon3=_const_eps_fn(eps_local[2, 2]),
+                phi=-jnp.deg2rad(angle_deg),
+            )
+        )
+
+    frequency_hz = GTM.c_const / (wavelength_nm * 1e-9)
+    system.initialize_sys(frequency_hz)
+    system.calculate_GammaStar(frequency_hz, zeta)
+    with jnp.errstate(divide="ignore", invalid="ignore"):
+        r_out, _, _, _ = system.calculate_r_t(zeta)
+    return complex(r_out[0])
+
+
+def _physical_port_fields(eps: complex, kappa_normalized: complex) -> jnp.ndarray:
+    q = jnp.sqrt(complex(eps) - complex(kappa_normalized) ** 2)
+    if jnp.imag(q) < 0.0 or (abs(jnp.imag(q)) < 1e-14 and jnp.real(q) < 0.0):
+        q = -q
+
+    return jnp.stack(
+        [
+            jnp.array([0.0, -q, 1.0, 0.0], dtype=jnp.complex128),
+            jnp.array([eps / q, 0.0, 0.0, -1.0], dtype=jnp.complex128),
+            jnp.array([0.0, q, 1.0, 0.0], dtype=jnp.complex128),
+            jnp.array([eps / q, 0.0, 0.0, 1.0], dtype=jnp.complex128),
+        ],
+        axis=1,
+    )
+
+
+def _rcwa_reflection_matrix_in_physical_ps_basis(
+    stack: Stack,
+    num_points: int = 256,
+) -> jnp.ndarray:
+    scattering_modal = Solver.total_scattering_matrix(
+        stack,
+        0,
+        num_points=num_points,
+        verbose=False,
+    )
+    substrate_reduced_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_substrate_normalized(0, num_points=num_points),
+        0,
+    )
+    superstrate_reduced_fields = Solver.isotropic_mode_fields(
+        stack.get_Q_superstrate_normalized(0, num_points=num_points),
+        0,
+    )
+    substrate_tangential_fields = Solver.reduced_to_tangential_fields(
+        substrate_reduced_fields,
+        Solver.isotropic_reduced_to_tangential_transform_component_major(
+            stack.eps_substrate,
+            0,
+        ),
+    )
+    superstrate_tangential_fields = Solver.reduced_to_tangential_fields(
+        superstrate_reduced_fields,
+        Solver.isotropic_reduced_to_tangential_transform_component_major(
+            stack.eps_superstrate,
+            0,
+        ),
+    )
+
+    scattering_physical = Solver.chain_scattering_matrices(
+        [
+            Solver.basis_change_scattering_matrix(
+                _physical_port_fields(stack.eps_substrate, stack.kappa_normalized),
+                substrate_tangential_fields,
+            ),
+            scattering_modal,
+            Solver.basis_change_scattering_matrix(
+                superstrate_tangential_fields,
+                _physical_port_fields(stack.eps_superstrate, stack.kappa_normalized),
+            ),
+        ]
+    )
+    return scattering_physical[0]
 
 
 def _uniform_anisotropic_layer_q_and_reference_fields(
@@ -730,7 +890,7 @@ def test_uniform_interface_matches_fresnel_coefficients(
     n_sup = jnp.sqrt(uniform_interface_stack.eps_superstrate)
     r_te_expected, t_te_expected = _fresnel_interface(n_sub, n_sup)
     r_tm_expected = -r_te_expected
-    t_tm_expected = 2 * n_sup / (n_sub + n_sup)
+    t_tm_expected = t_te_expected
 
     for N in [0, 1, 2]:
         r0_te, t0_te = _zero_order_field_rt(uniform_interface_stack, N, "TE")
@@ -753,7 +913,7 @@ def test_uniform_interface_conserves_energy(uniform_interface_stack: Stack) -> N
         R_te = jnp.abs(r0_te) ** 2
         T_te = jnp.abs(t0_te) ** 2 * (n_sup / n_sub)
         R_tm = jnp.abs(r0_tm) ** 2
-        T_tm = jnp.abs(t0_tm) ** 2 * (n_sub / n_sup)
+        T_tm = jnp.abs(t0_tm) ** 2 * (n_sup / n_sub)
 
         assert jnp.isclose(R_te + T_te, 1.0, atol=1e-10)
         assert jnp.isclose(R_tm + T_tm, 1.0, atol=1e-10)
@@ -811,7 +971,7 @@ def test_single_isotropic_quarter_wave_film_matches_analytic_reflectance() -> No
         transmittance = (
             jnp.abs(t0) ** 2 * (n_exit / n_incident)
             if pol == "TE"
-            else jnp.abs(t0) ** 2 * (n_incident / n_exit)
+            else jnp.abs(t0) ** 2 * (n_exit / n_incident)
         )
 
         assert jnp.isclose(reflectance, reflectance_expected, atol=1e-10)
@@ -870,7 +1030,7 @@ def test_dielectric_mirror_reflectance_matches_analytic_stack_and_grows_with_per
         reflectance_te = jnp.abs(r0_te) ** 2
         reflectance_tm = jnp.abs(r0_tm) ** 2
         transmittance_te = jnp.abs(t0_te) ** 2 * (n_exit / n_incident)
-        transmittance_tm = jnp.abs(t0_tm) ** 2 * (n_incident / n_exit)
+        transmittance_tm = jnp.abs(t0_tm) ** 2 * (n_exit / n_incident)
 
         assert jnp.isclose(reflectance_te, reflectance_expected, atol=1e-10)
         assert jnp.isclose(reflectance_tm, reflectance_expected, atol=1e-10)
@@ -1113,6 +1273,97 @@ def test_rotated_lossy_anisotropic_film_mixes_polarization_and_absorbs_power() -
     assert jnp.abs(transmitted_aligned_E_x) < 1e-12
     assert jnp.abs(transmitted_rotated_E_x) > 5e-2
     assert reflectance + transmittance < 0.9
+
+
+def test_oblique_axis_aligned_anisotropic_film_rpp_matches_pygtm() -> None:
+    wavelength_nm = 633.0
+    zeta = jnp.sin(jnp.deg2rad(32.0))
+    eps_incident = 1.0
+    eps_exit = 1.7**2
+    eps_local = jnp.diag(
+        jnp.array(
+            [
+                (1.60 + 0.02j) ** 2,
+                (2.05 + 0.03j) ** 2,
+                (1.80 + 0.01j) ** 2,
+            ],
+            dtype=jnp.complex128,
+        )
+    )
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=zeta * 2 * jnp.pi / wavelength_nm,
+        eps_substrate=eps_incident,
+        eps_superstrate=eps_exit,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            120.0,
+            eps_local,
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    reflection_matrix_rcwa = _rcwa_reflection_matrix_in_physical_ps_basis(stack)
+    rpp_rcwa = reflection_matrix_rcwa[1, 1]
+    rpp_pygtm = _pygtm_rpp(
+        wavelength_nm,
+        zeta,
+        eps_incident,
+        eps_exit,
+        [(120.0, eps_local, 0.0)],
+    )
+
+    assert jnp.isclose(rpp_rcwa, rpp_pygtm, atol=1e-10)
+
+
+@pytest.mark.parametrize("angle_deg", [0.0, 27.0])
+def test_oblique_nbocl2_hbn_stack_rpp_matches_pygtm(angle_deg: float) -> None:
+    wavelength_nm = 780.0
+    zeta = 1.4
+    eps_incident = 1.0
+    eps_exit = 3.674**2
+    eps_nbocl2_local = jnp.diag(
+        jnp.array([4.0, 6.0, 1.6**2], dtype=jnp.complex128)
+    )
+    eps_hbn = (1.4531**2) * jnp.eye(3, dtype=jnp.complex128)
+
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=zeta * 2 * jnp.pi / wavelength_nm,
+        eps_substrate=eps_incident,
+        eps_superstrate=eps_exit,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            122.0,
+            _rotate_in_plane_eps(eps_nbocl2_local, jnp.deg2rad(angle_deg)),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+    stack.add_layer(
+        Layer.uniform(
+            90.0,
+            eps_hbn,
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    reflection_matrix_rcwa = _rcwa_reflection_matrix_in_physical_ps_basis(stack)
+    rpp_rcwa = reflection_matrix_rcwa[1, 1]
+    rpp_pygtm = _pygtm_rpp(
+        wavelength_nm,
+        zeta,
+        eps_incident,
+        eps_exit,
+        [
+            (122.0, eps_nbocl2_local, angle_deg),
+            (90.0, eps_hbn, 0.0),
+        ],
+    )
+
+    assert jnp.isclose(rpp_rcwa, rpp_pygtm, atol=1e-10)
 
 
 def test_quarter_wave_plate_at_45_degrees_produces_nearly_equal_transmitted_field_components() -> None:

@@ -6,6 +6,7 @@ import numpy as jnp
 import scipy.linalg
 
 from . import _config  # noqa: F401
+from .layer import Layer
 from .stack import Stack
 
 
@@ -63,6 +64,48 @@ class Solver:
 
         num_h = matrix.shape[0] // 4
         return matrix.reshape(4, num_h, 4, num_h).transpose(1, 0, 3, 2).reshape(matrix.shape)
+
+    @staticmethod
+    def reduced_to_tangential_fields(
+        reduced_fields: jnp.ndarray,
+        reduced_to_tangential_component_major: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Convert modal fields from the reduced D-field basis to tangential fields.
+
+        Internal propagation continues to use the reduced basis
+
+            [-H_y, H_x, E_y, D_x]
+
+        because that basis is needed for the Fourier-factorized layer operator.
+        Only the zero-thickness interface basis changes use tangential
+        continuity, so before matching adjacent media we convert rows to
+
+            [-H_y, H_x, E_y, E_x].
+        """
+        transform_harmonic_major = Solver.component_to_harmonic_major(
+            reduced_to_tangential_component_major
+        )
+        return transform_harmonic_major @ reduced_fields
+
+    @staticmethod
+    def isotropic_reduced_to_tangential_transform_component_major(
+        eps: complex,
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the isotropic reduced-to-tangential interface map in component-major order."""
+        num_h = Stack.num_harmonics(N)
+        identity = jnp.eye(num_h, dtype=jnp.complex128)
+        zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+        inv_eps = identity / jnp.asarray(eps, dtype=jnp.complex128)
+
+        return jnp.block(
+            [
+                [identity, zero, zero, zero],
+                [zero, identity, zero, zero],
+                [zero, zero, identity, zero],
+                [zero, zero, zero, inv_eps],
+            ]
+        )
 
     @staticmethod
     def zero_order_mode_index(N: int, incident_pol: str) -> int:
@@ -487,6 +530,10 @@ class Solver:
             ),
         )
         q_matrices = stack.build_all_Q_matrices_normalized(N, num_points=num_points)
+        layer_toeplitz_matrices = [
+            layer.build_toeplitz_fourier_matrices(N, num_points=num_points)
+            for layer in stack.layers
+        ]
         Solver._log(verbose, f"Built {len(q_matrices)} component-major layer Q matrices")
         q_matrices_harmonic_major = [
             Solver.component_to_harmonic_major(q_matrix) for q_matrix in q_matrices
@@ -499,37 +546,70 @@ class Solver:
             stack.get_Q_substrate_normalized(N, num_points=num_points),
             N,
         )
+        substrate_continuity_fields = Solver.reduced_to_tangential_fields(
+            substrate_fields,
+            Solver.isotropic_reduced_to_tangential_transform_component_major(
+                stack.eps_substrate,
+                N,
+            ),
+        )
         Solver._log(verbose, "Diagonalizing isotropic superstrate modes")
         superstrate_fields = Solver.isotropic_mode_fields(
             stack.get_Q_superstrate_normalized(N, num_points=num_points),
             N,
         )
+        superstrate_continuity_fields = Solver.reduced_to_tangential_fields(
+            superstrate_fields,
+            Solver.isotropic_reduced_to_tangential_transform_component_major(
+                stack.eps_superstrate,
+                N,
+            ),
+        )
 
         if not q_matrices_harmonic_major:
             Solver._log(verbose, "No internal layers found; returning direct substrate/superstrate basis change")
-            return Solver.basis_change_scattering_matrix(substrate_fields, superstrate_fields)
+            return Solver.basis_change_scattering_matrix(
+                substrate_continuity_fields,
+                superstrate_continuity_fields,
+            )
 
-        layer_modes: list[tuple[jnp.ndarray, jnp.ndarray]] = []
+        layer_modes: list[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]] = []
         reference_fields = substrate_fields
-        for i, q_matrix in enumerate(q_matrices_harmonic_major):
+        for i, (q_matrix, toeplitz_matrices) in enumerate(
+            zip(q_matrices_harmonic_major, layer_toeplitz_matrices)
+        ):
             Solver._log(
                 verbose,
                 f"Diagonalizing layer {i} Q matrix with shape {q_matrix.shape}",
             )
-            mode_data = Solver.layer_mode_fields(q_matrix, reference_fields, verbose=verbose)
-            layer_modes.append(mode_data)
-            reference_fields = mode_data[1]
+            eigenvalues, layer_fields = Solver.layer_mode_fields(
+                q_matrix,
+                reference_fields,
+                verbose=verbose,
+            )
+            layer_continuity_fields = Solver.reduced_to_tangential_fields(
+                layer_fields,
+                Layer.build_reduced_to_tangential_field_transform_component_major(
+                    toeplitz_matrices,
+                    N,
+                ),
+            )
+            layer_modes.append((eigenvalues, layer_fields, layer_continuity_fields))
+            reference_fields = layer_fields
             Solver._log(
                 verbose,
-                f"Sorted layer {i} modes into forward/backward basis ({mode_data[0].shape[0]} eigenvalues)",
+                f"Sorted layer {i} modes into forward/backward basis ({eigenvalues.shape[0]} eigenvalues)",
             )
 
         Solver._log(verbose, "Building substrate-to-layer-0 basis-change scattering matrix")
         S_list: list[ScatteringMatrix] = [
-            Solver.basis_change_scattering_matrix(substrate_fields, layer_modes[0][1])
+            Solver.basis_change_scattering_matrix(
+                substrate_continuity_fields,
+                layer_modes[0][2],
+            )
         ]
 
-        for i, (layer_eigenvalues, layer_fields) in enumerate(layer_modes):
+        for i, (layer_eigenvalues, layer_fields, layer_continuity_fields) in enumerate(layer_modes):
             Solver._log(
                 verbose,
                 f"Building modal propagation scattering matrix for layer {i} with thickness {stack.thickness_normalized(i):.6g}",
@@ -541,14 +621,18 @@ class Solver:
                 )
             )
             right_fields = (
-                superstrate_fields if i == len(layer_modes) - 1 else layer_modes[i + 1][1]
+                superstrate_continuity_fields
+                if i == len(layer_modes) - 1
+                else layer_modes[i + 1][2]
             )
             target_name = "superstrate" if i == len(layer_modes) - 1 else f"layer {i + 1}"
             Solver._log(
                 verbose,
                 f"Building basis-change scattering matrix from layer {i} to {target_name}",
             )
-            S_list.append(Solver.basis_change_scattering_matrix(layer_fields, right_fields))
+            S_list.append(
+                Solver.basis_change_scattering_matrix(layer_continuity_fields, right_fields)
+            )
 
         Solver._log(verbose, f"Concatenating {len(S_list)} scattering matrices with Redheffer star products")
         return Solver.chain_scattering_matrices(S_list)

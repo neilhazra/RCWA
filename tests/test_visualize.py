@@ -3,14 +3,18 @@ from __future__ import annotations
 import numpy as jnp
 import pytest
 
-from rcwa import Layer, Stack
-from scripts.visualize import (
+from rcwa import Layer, Solver, Stack
+from rcwa.visualize import (
     _field_k_at_local_depth,
     _layer_face_coefficients,
     _first_supported_symmetric_slab_mode_thickness_nm,
     _symmetric_slab_mode_kappa_inv_nm,
+    VisualizationBundle,
+    compute_visualization_bundle,
+    create_x_line_profile_at_fixed_z_from_bundle,
     evaluate_real_space_from_k,
     create_x_line_profile_at_fixed_z,
+    create_xz_profile_from_bundle,
     create_xz_profile,
 )
 
@@ -26,6 +30,27 @@ def _uniform_single_layer_stack() -> Stack:
         Layer.uniform(
             thickness_nm=120.0,
             eps_tensor=2.25 * jnp.eye(3, dtype=jnp.complex128),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+    return stack
+
+
+def _oblique_anisotropic_single_layer_stack() -> Stack:
+    wavelength_nm = 780.0
+    zeta = 0.75
+    stack = Stack(
+        wavelength_nm=wavelength_nm,
+        kappa_inv_nm=zeta * 2 * jnp.pi / wavelength_nm,
+        eps_substrate=1.0,
+        eps_superstrate=2.25,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm=122.0,
+            eps_tensor=jnp.diag(
+                jnp.array([4.0, 6.0, 1.6**2], dtype=jnp.complex128)
+            ),
             x_domain_nm=(0.0, 500.0),
         )
     )
@@ -237,6 +262,114 @@ def test_create_xz_profile_matches_fixed_z_line_profiles_row_by_row() -> None:
         )
         assert jnp.array_equal(row_x, x_nm)
         assert jnp.allclose(field_xz[row], row_field, atol=1e-10)
+
+
+def test_visualization_bundle_matches_individual_profiles_and_roundtrips(
+    tmp_path,
+) -> None:
+    stack = _uniform_single_layer_stack()
+    cache_path = tmp_path / "visualization_bundle.npz"
+    bundle = compute_visualization_bundle(
+        stack,
+        N=1,
+        num_points_x=48,
+        num_points_z=5,
+        num_points_rcwa=128,
+        cache_path=cache_path,
+        verbose=False,
+    )
+
+    assert cache_path.exists()
+    assert set(bundle.polarization_data) == {"TE", "TM"}
+
+    for pol, component in [("TE", "E_y"), ("TM", "-H_y")]:
+        expected_reflected, expected_transmitted = Solver.reflection_transmission(
+            stack,
+            1,
+            incident_pol=pol,
+            num_points=128,
+            verbose=False,
+        )
+        actual_pol_data = bundle.incident_data(pol)
+        assert actual_pol_data.component == component
+        assert jnp.allclose(actual_pol_data.reflected, expected_reflected, atol=1e-12)
+        assert jnp.allclose(actual_pol_data.transmitted, expected_transmitted, atol=1e-12)
+
+        expected_x, expected_z, expected_field_xz = create_xz_profile(
+            stack,
+            layer_index=0,
+            incident_pol=pol,
+            component=component,
+            N=1,
+            num_points_x=48,
+            num_points_z=5,
+            num_points_rcwa=128,
+            verbose=False,
+        )
+        actual_x, actual_z, actual_field_xz = create_xz_profile_from_bundle(
+            bundle,
+            incident_pol=pol,
+            layer_index=0,
+        )
+        assert jnp.array_equal(actual_x, expected_x)
+        assert jnp.array_equal(actual_z, expected_z)
+        assert jnp.allclose(actual_field_xz, expected_field_xz, atol=1e-10)
+
+        line_x, line_field = create_x_line_profile_at_fixed_z_from_bundle(
+            bundle,
+            incident_pol=pol,
+            layer_index=0,
+            z_nm=float(expected_z[2]),
+        )
+        assert jnp.array_equal(line_x, expected_x)
+        assert jnp.allclose(line_field, expected_field_xz[2], atol=1e-10)
+
+    loaded = VisualizationBundle.load(cache_path)
+    assert loaded.N == bundle.N
+    assert loaded.num_points_rcwa == bundle.num_points_rcwa
+    assert loaded.num_points_x == bundle.num_points_x
+    assert loaded.num_points_z == bundle.num_points_z
+    assert complex(loaded.kappa_inv_nm) == complex(bundle.kappa_inv_nm)
+    for pol in ["TE", "TM"]:
+        loaded_pol = loaded.incident_data(pol)
+        bundle_pol = bundle.incident_data(pol)
+        assert loaded_pol.component == bundle_pol.component
+        assert jnp.allclose(loaded_pol.reflected, bundle_pol.reflected, atol=1e-12)
+        assert jnp.allclose(loaded_pol.transmitted, bundle_pol.transmitted, atol=1e-12)
+        assert jnp.allclose(
+            loaded_pol.layer_profiles[0].field_xz,
+            bundle_pol.layer_profiles[0].field_xz,
+            atol=1e-12,
+        )
+
+
+def test_layer_face_coefficients_use_tangential_continuity_for_oblique_anisotropic_layer() -> None:
+    stack = _oblique_anisotropic_single_layer_stack()
+    N = 0
+    num_points_rcwa = 128
+    modal_data, left_coeffs, _ = _layer_face_coefficients(
+        stack,
+        layer_index=0,
+        incident_pol="TM",
+        N=N,
+        num_points_rcwa=num_points_rcwa,
+        verbose=False,
+    )
+    S11, _, _, _ = Solver.total_scattering_matrix(
+        stack,
+        N,
+        num_points=num_points_rcwa,
+        verbose=False,
+    )
+    inc = jnp.zeros(2 * Stack.num_harmonics(N), dtype=jnp.complex128)
+    inc[Solver.zero_order_mode_index(N, "TM")] = 1.0
+    reflected = S11 @ inc
+    substrate_coeffs = jnp.concatenate([inc, reflected])
+
+    substrate_tangential_field = modal_data.substrate_continuity_fields @ substrate_coeffs
+    layer_tangential_field = modal_data.layer_modes[0][2] @ left_coeffs
+
+    assert jnp.allclose(substrate_tangential_field, layer_tangential_field, atol=1e-10)
 
 
 def test_create_xz_profile_supports_arbitrary_layer_index_and_returns_finite_arrays(

@@ -85,6 +85,23 @@ class Layer:
         # shorthand compound functions below.
         field_quantities["inv_hat_eps_xx"] = 1.0 / field_quantities["hat_eps_xx"]
 
+        # At z-interfaces the continuous tangential field is E_x, not D_x.
+        # For the in-plane anisotropic stacks exercised by this solver path,
+        #
+        #   D_x(x) = \hat{\epsilon}_{xx}(x) E_x(x) + \hat{\epsilon}_{xy}(x) E_y(x)
+        #
+        # so the interface map uses
+        #
+        #   E_x(x) = \hat{\epsilon}_{xx}^{-1}(x) D_x(x)
+        #            - \hat{\epsilon}_{xx}^{-1}(x)\hat{\epsilon}_{xy}(x) E_y(x).
+        #
+        # We cache the pointwise product directly so its Fourier-convolution
+        # matrix is built from the product spectrum rather than from a product
+        # of separately truncated Toeplitz matrices.
+        field_quantities["inv_hat_eps_xx_hat_eps_xy"] = (
+            field_quantities["inv_hat_eps_xx"] * field_quantities["hat_eps_xy"]
+        )
+
         # This is the further-reduced yy entry:
         #   \tilde{\epsilon}_{yy}(x)
         #     = \hat{\epsilon}_{yy}(x)
@@ -221,6 +238,36 @@ class Layer:
                 for key, coeffs in fourier_coeffs.items()
             }
         return self._toeplitz_cache[cache_key]
+
+    @staticmethod
+    def build_reduced_to_tangential_field_transform_component_major(
+        toeplitz_matrices: dict[str, jnp.ndarray],
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the component-major map from ``[-H_y, H_x, E_y, D_x]`` to tangential fields.
+
+        The output acts on vectors ordered as
+
+            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T
+
+        and produces the corresponding tangential-field vector
+
+            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), E_x(-N..N)]^T.
+        """
+        num_h = 2 * N + 1
+        identity = jnp.eye(num_h, dtype=jnp.complex128)
+        zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+        inv_hat_eps_xx = toeplitz_matrices["inv_hat_eps_xx"]
+        inv_hat_eps_xx_hat_eps_xy = toeplitz_matrices["inv_hat_eps_xx_hat_eps_xy"]
+
+        return jnp.block(
+            [
+                [identity, zero, zero, zero],
+                [zero, identity, zero, zero],
+                [zero, zero, identity, zero],
+                [zero, zero, -inv_hat_eps_xx_hat_eps_xy, inv_hat_eps_xx],
+            ]
+        )
 
     @staticmethod
     def build_K_x_diag_matrix(
