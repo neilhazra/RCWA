@@ -19,10 +19,10 @@ from rcwa.visualize import (
 )
 
 
-N = 512
+N = 2048
 VERBOSE = True
-NUM_POINTS_RCWA = 4096
-NUM_POINTS_X = 1400
+NUM_POINTS_RCWA = 4096*2
+NUM_POINTS_X = 1400*4
 NUM_POINTS_Z = 161
 PLOT_QUANTITY = "abs"
 INCIDENT_POLS = ("TE", "TM")
@@ -33,8 +33,8 @@ n_wg = 2.0
 n_sub = 1.0
 n_sup = 1.0
 local_grating_period_nm = 399.8
-supercell_period_nm = 7_000.0
-grating_length_nm = 2_980.0
+supercell_period_nm = 25_000.0
+grating_length_nm = 2_000.0
 d_slab_nm = 120.0
 d_grating_nm = 60.0
 duty_cycle = 0.5
@@ -208,6 +208,8 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     stack = make_stack(design_wl_nm)
+    plot_geometry()
+    plt.show()
     if LOAD_BUNDLE_FROM_CACHE_IF_PRESENT and CACHE_PATH.exists():
         bundle = VisualizationBundle.load(CACHE_PATH)
         print(f"Loaded visualization bundle from {CACHE_PATH}")
@@ -244,7 +246,6 @@ def main() -> None:
             f"|r0|^2 = {float(abs(r0) ** 2):.6f}, |t0|^2 = {float(abs(t0) ** 2):.6f}"
         )
 
-    plot_geometry()
 
     for pol in INCIDENT_POLS:
         component = bundle.incident_data(pol).component
