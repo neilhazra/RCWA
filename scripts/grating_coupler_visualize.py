@@ -1,12 +1,9 @@
 """Visualize design-point fields for the finite grating coupler supercell."""
 
 from __future__ import annotations
-
 import pathlib
 import sys
-
 import numpy as jnp
-
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
