@@ -42,14 +42,14 @@ RCWA_COMPONENTS_BY_POL = {"TE": "E_y", "TM": "-H_y"}
 MEEP_COMPONENT_LABELS = {"TE": "E_y", "TM": "H_y"}
 MEEP_SOURCE_COMPONENTS = {"TE": mp.Ez, "TM": mp.Hz}
 
-RCWA_ORDER = 32
+RCWA_ORDER = 512
 RCWA_NUM_POINTS_X = 320
 RCWA_NUM_POINTS_Z = 181
 RCWA_NUM_POINTS_FOURIER = 4096
 
-MEEP_RESOLUTION = 80
+MEEP_RESOLUTION = 256
 MEEP_GAUSSIAN_FWIDTH_FACTOR = 0.15
-MEEP_DECAY_STEPS = 80
+MEEP_DECAY_STEPS = 256
 MEEP_DECAY_THRESHOLD = 1e-8
 
 SUBSTRATE_BUFFER_NM = 600.0
@@ -444,6 +444,64 @@ def _interp_meep_to_rcwa_grid(
     return interpolator(points).reshape(z_mesh_nm.shape)
 
 
+def _plot_overlay_polyline(
+    ax,
+    x_nm: np.ndarray,
+    z_nm: np.ndarray,
+) -> None:
+    """Draw one high-contrast geometry line on top of a field image."""
+    ax.plot(x_nm, z_nm, color="black", lw=2.8, alpha=0.9, zorder=10)
+    ax.plot(x_nm, z_nm, color="white", lw=1.2, alpha=0.95, zorder=11)
+
+
+def _layer_geometry_rectangles(
+    spec: DeviceSpec,
+) -> list[tuple[float, float, float, float]]:
+    """Return rectangular geometry features as ``(x0, x1, z0, z1)`` in nm."""
+    rectangles: list[tuple[float, float, float, float]] = []
+    x0_nm, x1_nm = spec.x_domain_nm
+    z0_nm = 0.0
+    for layer_spec in spec.layers:
+        z1_nm = z0_nm + layer_spec.thickness_nm
+        rectangles.append((x0_nm, x1_nm, z0_nm, z1_nm))
+        if not layer_spec.is_uniform:
+            ridge_width_nm = layer_spec.fill_fraction * spec.period_nm
+            ridge_x0_nm = -0.5 * ridge_width_nm
+            ridge_x1_nm = 0.5 * ridge_width_nm
+            rectangles.append((ridge_x0_nm, ridge_x1_nm, z0_nm, z1_nm))
+        z0_nm = z1_nm
+    return rectangles
+
+
+def _overlay_device_geometry(ax, spec: DeviceSpec) -> None:
+    """Overlay the layer geometry outline on one comparison panel."""
+    x0_nm, x1_nm = spec.x_domain_nm
+    for rect_x0_nm, rect_x1_nm, rect_z0_nm, rect_z1_nm in _layer_geometry_rectangles(spec):
+        _plot_overlay_polyline(
+            ax,
+            np.array([rect_x0_nm, rect_x1_nm], dtype=np.float64),
+            np.array([rect_z0_nm, rect_z0_nm], dtype=np.float64),
+        )
+        _plot_overlay_polyline(
+            ax,
+            np.array([rect_x0_nm, rect_x1_nm], dtype=np.float64),
+            np.array([rect_z1_nm, rect_z1_nm], dtype=np.float64),
+        )
+        _plot_overlay_polyline(
+            ax,
+            np.array([rect_x0_nm, rect_x0_nm], dtype=np.float64),
+            np.array([rect_z0_nm, rect_z1_nm], dtype=np.float64),
+        )
+        _plot_overlay_polyline(
+            ax,
+            np.array([rect_x1_nm, rect_x1_nm], dtype=np.float64),
+            np.array([rect_z0_nm, rect_z1_nm], dtype=np.float64),
+        )
+
+    ax.set_xlim(x0_nm, x1_nm)
+    ax.set_ylim(0.0, spec.total_thickness_nm)
+
+
 def _plot_comparison(
     spec: DeviceSpec,
     incident_pol: str,
@@ -480,6 +538,7 @@ def _plot_comparison(
         ax.set_xlabel("x (nm)")
         ax.set_ylabel("z from substrate interface (nm)")
         ax.set_title(title)
+        _overlay_device_geometry(ax, spec)
         fig.colorbar(image, ax=ax, shrink=0.9)
 
     component_label = RCWA_COMPONENTS_BY_POL[incident_pol]

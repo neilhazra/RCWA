@@ -45,7 +45,7 @@ from time import perf_counter
 import numpy as jnp
 
 from .layer import Layer
-from .solver import Solver
+from .solver import ScatteringMatrix, Solver
 from .stack import Stack
 
 
@@ -457,56 +457,145 @@ def _incident_modal_rt_from_scattering_matrix(
     return inc, reflected, transmitted
 
 
-def _march_layer_face_coefficients(
+def _identity_scattering_matrix(num_modes: int) -> ScatteringMatrix:
+    """Return the transparent two-port S-matrix on one modal basis."""
+    identity = jnp.eye(num_modes, dtype=jnp.complex128)
+    zero = jnp.zeros_like(identity)
+    return zero, identity, identity, zero
+
+
+def _layer_scattering_blocks(
     stack: Stack,
     modal_data: _StackModalData,
-    substrate_coeffs: jnp.ndarray,
-    stop_after_layer_index: int | None,
-    verbose: bool,
-) -> list[tuple[jnp.ndarray, jnp.ndarray]]:
-    """March modal coefficients across interfaces and return face coefficients layer-by-layer."""
-    layer_face_coeffs: list[tuple[jnp.ndarray, jnp.ndarray]] = []
-    current_right_coeffs: jnp.ndarray | None = None
+) -> list[ScatteringMatrix]:
+    """Return the interface/propagation S-matrices used by the visualization march."""
+    if not modal_data.layer_modes:
+        return []
+
+    blocks: list[ScatteringMatrix] = [
+        Solver.basis_change_scattering_matrix(
+            modal_data.substrate_continuity_fields,
+            modal_data.layer_modes[0][2],
+        )
+    ]
 
     for i, (eigenvalues, _, layer_continuity_fields) in enumerate(modal_data.layer_modes):
-        step_start = perf_counter()
-        if i == 0:
-            left_coeffs = Solver.basis_change_transfer_matrix(
-                modal_data.substrate_continuity_fields,
-                layer_continuity_fields,
-            ) @ substrate_coeffs
-        else:
-            previous_fields = modal_data.layer_modes[i - 1][2]
-            left_coeffs = Solver.basis_change_transfer_matrix(
-                previous_fields,
-                layer_continuity_fields,
-            ) @ current_right_coeffs
-        basis_change_elapsed = perf_counter() - step_start
-
-        step_start = perf_counter()
-        right_coeffs = (
-            _modal_propagation_transfer_matrix(
+        blocks.append(
+            Solver.modal_propagation_scattering_matrix(
                 eigenvalues,
                 stack.thickness_normalized(i),
             )
-            @ left_coeffs
         )
-        propagation_elapsed = perf_counter() - step_start
+        right_fields = (
+            modal_data.superstrate_continuity_fields
+            if i == len(modal_data.layer_modes) - 1
+            else modal_data.layer_modes[i + 1][2]
+        )
+        blocks.append(
+            Solver.basis_change_scattering_matrix(
+                layer_continuity_fields,
+                right_fields,
+            )
+        )
+
+    return blocks
+
+
+def _interface_modal_coefficients(
+    prefix_scattering: ScatteringMatrix,
+    suffix_scattering: ScatteringMatrix,
+    incident_coeffs: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return the modal coefficients incident on one internal interface from both sides.
+
+    If ``P`` is the S-matrix from the external substrate port up to the
+    interface and ``Q`` is the S-matrix from the interface to the external
+    superstrate port, then with no illumination from the superstrate side:
+
+        a_k^- = Q11 a_k^+
+        a_k^+ = P21 a_0^+ + P22 a_k^-
+
+    Solving this system yields the forward/right-going and backward/left-going
+    modal coefficients on the common interface in a numerically stable way that
+    avoids propagating the backward evanescent branch with ``exp(+lambda_b d)``.
+    """
+    _, _, P21, P22 = prefix_scattering
+    Q11, _, _, _ = suffix_scattering
+    identity = jnp.eye(P22.shape[0], dtype=P22.dtype)
+    forward_coeffs = jnp.linalg.solve(identity - P22 @ Q11, P21 @ incident_coeffs)
+    backward_coeffs = Q11 @ forward_coeffs
+    return forward_coeffs, backward_coeffs
+
+
+def _march_layer_face_coefficients(
+    stack: Stack,
+    modal_data: _StackModalData,
+    incident_coeffs: jnp.ndarray,
+    stop_after_layer_index: int | None,
+    verbose: bool,
+) -> list[tuple[jnp.ndarray, jnp.ndarray]]:
+    """Recover per-layer face coefficients using prefix/suffix scattering solves."""
+    if not modal_data.layer_modes:
+        return []
+
+    total_start = perf_counter()
+    blocks = _layer_scattering_blocks(stack, modal_data)
+    num_modes = incident_coeffs.shape[0]
+
+    step_start = perf_counter()
+    prefix_scattering: list[ScatteringMatrix] = [_identity_scattering_matrix(num_modes)]
+    for block in blocks:
+        prefix_scattering.append(
+            Solver.redheffer_star_product(prefix_scattering[-1], block)
+        )
+
+    suffix_scattering: list[ScatteringMatrix] = [
+        _identity_scattering_matrix(num_modes) for _ in range(len(blocks) + 1)
+    ]
+    for i in range(len(blocks) - 1, -1, -1):
+        suffix_scattering[i] = Solver.redheffer_star_product(
+            blocks[i],
+            suffix_scattering[i + 1],
+        )
+    _log_timing(verbose, "Built prefix/suffix scattering chains for visualization march", step_start)
+
+    layer_face_coeffs: list[tuple[jnp.ndarray, jnp.ndarray]] = []
+    for i in range(len(modal_data.layer_modes)):
+        left_interface_index = 2 * i + 1
+        right_interface_index = left_interface_index + 1
+
+        step_start = perf_counter()
+        left_forward, left_backward = _interface_modal_coefficients(
+            prefix_scattering[left_interface_index],
+            suffix_scattering[left_interface_index],
+            incident_coeffs,
+        )
+        left_elapsed = perf_counter() - step_start
+
+        step_start = perf_counter()
+        right_forward, right_backward = _interface_modal_coefficients(
+            prefix_scattering[right_interface_index],
+            suffix_scattering[right_interface_index],
+            incident_coeffs,
+        )
+        right_elapsed = perf_counter() - step_start
+
+        left_coeffs = jnp.concatenate([left_forward, left_backward])
+        right_coeffs = jnp.concatenate([right_forward, right_backward])
+        layer_face_coeffs.append((left_coeffs, right_coeffs))
 
         _log(
             verbose,
             (
-                f"Layer march {i}: basis change {_format_elapsed_seconds(basis_change_elapsed)}, "
-                f"propagation {_format_elapsed_seconds(propagation_elapsed)}"
+                f"Layer march {i}: left-interface solve {_format_elapsed_seconds(left_elapsed)}, "
+                f"right-interface solve {_format_elapsed_seconds(right_elapsed)}"
             ),
         )
-
-        layer_face_coeffs.append((left_coeffs, right_coeffs))
-        current_right_coeffs = right_coeffs
 
         if stop_after_layer_index is not None and i >= stop_after_layer_index:
             break
 
+    _log_timing(verbose, "Recovered layer face coefficients with scattering march", total_start)
     return layer_face_coeffs
 
 
@@ -653,46 +742,6 @@ def _layer_modal_data(
     return modal_data
 
 
-def _modal_propagation_transfer_matrix(
-    eigenvalues: jnp.ndarray,
-    distance_normalized: float,
-) -> jnp.ndarray:
-    """Return the left-to-right propagation transfer matrix inside one layer.
-
-    Basis before and after:
-    - input coefficients: layer modal basis at the left face
-
-          [a_L^+; a_L^-]
-
-      where the first half are forward/right-going layer modes and the second
-      half are backward/left-going layer modes.
-
-    - output coefficients: the same layer modal basis, but referenced at the
-      right face
-
-          [a_R^+; a_R^-].
-
-    The transfer matrix is diagonal because propagation does not mix modes
-    inside a uniform layer once that layer has been diagonalized:
-
-        [a_R^+]   [exp(lambda_f d)   0          ] [a_L^+]
-        [a_R^-] = [0                 exp(lambda_b d)] [a_L^-]
-
-    Here ``lambda_f`` are the forward eigenvalues and ``lambda_b`` are the
-    backward eigenvalues in the sorted layer modal basis.
-    """
-    if eigenvalues.ndim != 1 or eigenvalues.shape[0] % 2 != 0:
-        raise ValueError(
-            "Expected a 1D even-length eigenvalue array, "
-            f"got shape={eigenvalues.shape}."
-        )
-
-    half = eigenvalues.shape[0] // 2
-    forward = jnp.exp(eigenvalues[:half] * distance_normalized)
-    backward = jnp.exp(eigenvalues[half:] * distance_normalized)
-    return jnp.diag(jnp.concatenate([forward, backward]))
-
-
 def _validate_layer_index(stack: Stack, layer_index: int) -> None:
     """Validate that the requested physical layer exists.
 
@@ -723,26 +772,24 @@ def _layer_face_coefficients(
 
        in the isotropic substrate port basis.
 
-    2. Use the stack S-matrix to recover the reflected coefficients
+    2. Build the per-block scattering matrices for:
 
-           a_sub^- = S11 a_sub^+.
+       - substrate/layer basis changes,
+       - modal propagation inside each layer,
+       - layer/layer or layer/superstrate basis changes.
 
-    3. Concatenate them into the full substrate modal vector
+    3. Form prefix and suffix scattering chains up to every internal
+       interface, then solve the local interface relation
 
-           a_sub = [a_sub^+; a_sub^-].
+           a_k^- = Q11 a_k^+
+           a_k^+ = P21 a_0^+ + P22 a_k^-
 
-    4. For each interface, change basis with
+       for the modal coefficients on that interface.
 
-           a_right_basis = F_right^{-1} F_left a_left_basis
-
-       where ``F_left`` and ``F_right`` are the modes-to-fields matrices whose
-       columns are modal fields expressed in the common harmonic-major
-       tangential-field basis
-
-           [-H_y(n), H_x(n), E_y(n), E_x(n)].
-
-    5. Inside each layer, propagate with the diagonal transfer matrix from
-       ``_modal_propagation_transfer_matrix(...)``.
+       This keeps the forward/right-going modes referenced from the left and
+       the backward/left-going modes referenced from the right, avoiding the
+       unstable ``exp(+lambda_b d)`` transfer step for strongly evanescent
+       backward modes.
 
     Stored outputs:
     - ``left_coeffs`` is the selected layer modal coefficient vector at the left
@@ -774,24 +821,13 @@ def _layer_face_coefficients(
     _log_timing(verbose, "Built modal cache for face-coefficient recovery", step_start)
 
     step_start = perf_counter()
-    S11, _, _, _ = Solver.total_scattering_matrix(
-        stack,
-        N,
-        num_points=num_points_rcwa,
-        verbose=verbose,
-    )
-    _log_timing(verbose, "Built total scattering matrix", step_start)
-
-    step_start = perf_counter()
     inc = _incident_coefficients(N, incident_pol)
-    reflected = S11 @ inc
-    substrate_coeffs = jnp.concatenate([inc, reflected])
-    _log_timing(verbose, "Built substrate incident/reflected coefficient vector", step_start)
+    _log_timing(verbose, "Built substrate incident coefficient vector", step_start)
 
     layer_face_coeffs = _march_layer_face_coefficients(
         stack,
         modal_data=modal_data,
-        substrate_coeffs=substrate_coeffs,
+        incident_coeffs=inc,
         stop_after_layer_index=layer_index,
         verbose=verbose,
     )
@@ -1086,13 +1122,11 @@ def compute_visualization_bundle(
             N,
             pol,
         )
-        substrate_coeffs = jnp.concatenate([inc, reflected])
-
         step_start = perf_counter()
         layer_face_coeffs = _march_layer_face_coefficients(
             stack,
             modal_data=modal_data,
-            substrate_coeffs=substrate_coeffs,
+            incident_coeffs=inc,
             stop_after_layer_index=None,
             verbose=verbose,
         )

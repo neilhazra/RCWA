@@ -393,6 +393,35 @@ def test_create_xz_profile_supports_arbitrary_layer_index_and_returns_finite_arr
     assert jnp.all(jnp.isfinite(field_xz))
 
 
+def test_create_xz_profile_remains_finite_for_high_order_uniform_slab_visualization() -> None:
+    stack = Stack(
+        wavelength_nm=633.0,
+        kappa_inv_nm=0.0,
+        eps_substrate=1.0,
+        eps_superstrate=1.0,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm=120.0,
+            eps_tensor=2.25 * jnp.eye(3, dtype=jnp.complex128),
+            x_domain_nm=(0.0, 100.0),
+        )
+    )
+
+    _, _, field_xz = create_xz_profile(
+        stack,
+        layer_index=0,
+        incident_pol="TE",
+        component="E_y",
+        N=96,
+        num_points_x=16,
+        num_points_z=5,
+        num_points_rcwa=max(1024, 32 * (2 * 96 + 1)),
+    )
+
+    assert jnp.all(jnp.isfinite(field_xz))
+
+
 def test_visualize_helpers_raise_for_invalid_inputs() -> None:
     stack = _uniform_single_layer_stack()
 

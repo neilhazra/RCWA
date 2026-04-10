@@ -1,24 +1,62 @@
 {
   "_meta": {
     "meep_version": "1.33.0-beta",
-    "rcwa_order": 32,
+    "rcwa_order": 512,
     "rcwa_num_points_x": 320,
     "rcwa_num_points_z": 181,
     "rcwa_num_points_fourier": 4096,
-    "meep_resolution": 80
+    "meep_resolution": 256
   },
   "uniform_slab": {
     "TE": {
       "metrics": {
-        "rcwa_native_max_abs": 0.6584786669439577,
-        "meep_native_max_abs": 0.9507498557673975,
-        "rms_difference": 0.05588190328661354,
-        "max_difference": 0.11542321721734461,
-        "mean_difference": 0.04000050196572491,
+        "rcwa_native_max_abs": 0.6584786669439576,
+        "meep_native_max_abs": 0.9503080831356733,
+        "rms_difference": 0.055962576855937855,
+        "max_difference": 0.11090328910691527,
+        "mean_difference": 0.04076793303168347,
         "meep_version": "1.33.0-beta"
       },
       "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/uniform_slab_te_comparison_data.npz",
       "figure": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/uniform_slab_te_normalized_compare.png"
+    },
+    "TM": {
+      "metrics": {
+        "rcwa_native_max_abs": 0.9082443398333765,
+        "meep_native_max_abs": 1.901727941352213,
+        "rms_difference": 0.06531122428569522,
+        "max_difference": 0.11099207229443175,
+        "mean_difference": 0.05193190120266053,
+        "meep_version": "1.33.0-beta"
+      },
+      "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/uniform_slab_tm_comparison_data.npz",
+      "figure": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/uniform_slab_tm_normalized_compare.png"
+    }
+  },
+  "binary_grating_on_slab": {
+    "TE": {
+      "metrics": {
+        "rcwa_native_max_abs": 1.3674170930376286,
+        "meep_native_max_abs": 2.0939175567551693,
+        "rms_difference": 0.0857981101475004,
+        "max_difference": 0.1866281476011511,
+        "mean_difference": 0.07115445809339235,
+        "meep_version": "1.33.0-beta"
+      },
+      "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/binary_grating_on_slab_te_comparison_data.npz",
+      "figure": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/binary_grating_on_slab_te_normalized_compare.png"
+    },
+    "TM": {
+      "metrics": {
+        "rcwa_native_max_abs": 2.11807822136331,
+        "meep_native_max_abs": 4.171357553771537,
+        "rms_difference": 0.05707513038184309,
+        "max_difference": 0.09801552799660701,
+        "mean_difference": 0.049942951308019304,
+        "meep_version": "1.33.0-beta"
+      },
+      "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/binary_grating_on_slab_tm_comparison_data.npz",
+      "figure": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/binary_grating_on_slab_tm_normalized_compare.png"
     }
   }
 }
