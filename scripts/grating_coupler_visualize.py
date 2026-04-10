@@ -16,7 +16,7 @@ from rcwa.visualize import (
 )
 
 
-N = 2048
+N = 512
 VERBOSE = True
 NUM_POINTS_RCWA = 4096*2
 NUM_POINTS_X = 1400*4

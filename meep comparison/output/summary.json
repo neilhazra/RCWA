@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "meep_version": "1.33.0-beta",
+    "rcwa_order": 32,
+    "rcwa_num_points_x": 320,
+    "rcwa_num_points_z": 181,
+    "rcwa_num_points_fourier": 4096,
+    "meep_resolution": 80
+  },
+  "uniform_slab": {
+    "TE": {
+      "metrics": {
+        "rcwa_native_max_abs": 0.6584786669439577,
+        "meep_native_max_abs": 0.9507498557673975,
+        "rms_difference": 0.05588190328661354,
+        "max_difference": 0.11542321721734461,
+        "mean_difference": 0.04000050196572491,
+        "meep_version": "1.33.0-beta"
+      },
+      "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/uniform_slab_te_comparison_data.npz",
+      "figure": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/uniform_slab_te_normalized_compare.png"
+    }
+  }
+}
