@@ -45,7 +45,7 @@ from time import perf_counter
 import numpy as jnp
 
 from .layer import Layer
-from .solver import ScatteringMatrix, Solver
+from .solver import ScatteringMatrix, Solver, StackSolveData
 from .stack import Stack
 
 
@@ -76,60 +76,15 @@ def _log_timing(verbose: bool, label: str, start_time: float) -> None:
         _log(verbose, f"{label}: {_format_elapsed_seconds(perf_counter() - start_time)}")
 
 
+_StackModalData = StackSolveData
+
+
 @dataclass
-class _StackModalData:
-    """Cache the modal objects used to reconstruct fields inside the stack.
+class _VisualizationScatteringChains:
+    """Reusable interface-chain factorizations for field reconstruction."""
 
-    Attributes
-    ----------
-    q_matrices_component_major:
-        Full layer operators in the component-major basis
-
-            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
-
-    q_matrices_harmonic_major:
-        The same operators after the similarity transform
-
-            Q_harmonic = P Q_component P^T
-
-        with ``P = Solver.reorder_matrix(N)``. In this basis the rows and
-        columns are grouped harmonic-by-harmonic as
-
-            [-H_y(n), H_x(n), E_y(n), D_x(n)].
-
-    substrate_fields, superstrate_fields:
-        Modes-to-fields matrices whose columns are isotropic port modes in the
-        solver ordering
-
-            [forward_TE(-N..N), forward_TM(-N..N),
-             backward_TE(-N..N), backward_TM(-N..N)]
-
-        and whose rows are the harmonic-major reduced-field basis.
-
-    substrate_continuity_fields, superstrate_continuity_fields:
-        The corresponding port modal maps after converting rows into the
-        harmonic-major tangential-field basis
-
-            [-H_y(n), H_x(n), E_y(n), E_x(n)].
-
-    layer_modes:
-        One ``(eigenvalues, layer_fields, layer_continuity_fields)`` tuple per
-        physical layer. Each ``layer_fields`` matrix maps layer modal
-        coefficients in the ordering
-
-            [all forward layer modes, all backward layer modes]
-
-        into the harmonic-major reduced-field basis, while
-        ``layer_continuity_fields`` maps the same modal coefficients into the
-        harmonic-major tangential-field basis used only at z-interfaces.
-    """
-    q_matrices_component_major: list[jnp.ndarray]
-    q_matrices_harmonic_major: list[jnp.ndarray]
-    substrate_fields: jnp.ndarray
-    superstrate_fields: jnp.ndarray
-    substrate_continuity_fields: jnp.ndarray
-    superstrate_continuity_fields: jnp.ndarray
-    layer_modes: list[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]
+    prefix_scattering: list[ScatteringMatrix]
+    suffix_scattering: list[ScatteringMatrix]
 
 
 @dataclass
@@ -457,48 +412,28 @@ def _incident_modal_rt_from_scattering_matrix(
     return inc, reflected, transmitted
 
 
-def _identity_scattering_matrix(num_modes: int) -> ScatteringMatrix:
-    """Return the transparent two-port S-matrix on one modal basis."""
-    identity = jnp.eye(num_modes, dtype=jnp.complex128)
-    zero = jnp.zeros_like(identity)
-    return zero, identity, identity, zero
-
-
 def _layer_scattering_blocks(
     stack: Stack,
     modal_data: _StackModalData,
 ) -> list[ScatteringMatrix]:
     """Return the interface/propagation S-matrices used by the visualization march."""
-    if not modal_data.layer_modes:
-        return []
+    return Solver.stack_scattering_blocks(stack, modal_data)
 
-    blocks: list[ScatteringMatrix] = [
-        Solver.basis_change_scattering_matrix(
-            modal_data.substrate_continuity_fields,
-            modal_data.layer_modes[0][2],
-        )
-    ]
 
-    for i, (eigenvalues, _, layer_continuity_fields) in enumerate(modal_data.layer_modes):
-        blocks.append(
-            Solver.modal_propagation_scattering_matrix(
-                eigenvalues,
-                stack.thickness_normalized(i),
-            )
-        )
-        right_fields = (
-            modal_data.superstrate_continuity_fields
-            if i == len(modal_data.layer_modes) - 1
-            else modal_data.layer_modes[i + 1][2]
-        )
-        blocks.append(
-            Solver.basis_change_scattering_matrix(
-                layer_continuity_fields,
-                right_fields,
-            )
-        )
-
-    return blocks
+def _build_visualization_scattering_chains(
+    stack: Stack,
+    modal_data: _StackModalData,
+    verbose: bool,
+) -> _VisualizationScatteringChains:
+    """Build reusable prefix/suffix scattering chains for one stack."""
+    step_start = perf_counter()
+    blocks = _layer_scattering_blocks(stack, modal_data)
+    prefix_scattering, suffix_scattering = Solver.scattering_prefix_suffix_chains(blocks)
+    _log_timing(verbose, "Built prefix/suffix scattering chains for visualization march", step_start)
+    return _VisualizationScatteringChains(
+        prefix_scattering=prefix_scattering,
+        suffix_scattering=suffix_scattering,
+    )
 
 
 def _interface_modal_coefficients(
@@ -532,6 +467,7 @@ def _march_layer_face_coefficients(
     modal_data: _StackModalData,
     incident_coeffs: jnp.ndarray,
     stop_after_layer_index: int | None,
+    scattering_chains: _VisualizationScatteringChains | None,
     verbose: bool,
 ) -> list[tuple[jnp.ndarray, jnp.ndarray]]:
     """Recover per-layer face coefficients using prefix/suffix scattering solves."""
@@ -539,25 +475,14 @@ def _march_layer_face_coefficients(
         return []
 
     total_start = perf_counter()
-    blocks = _layer_scattering_blocks(stack, modal_data)
-    num_modes = incident_coeffs.shape[0]
-
-    step_start = perf_counter()
-    prefix_scattering: list[ScatteringMatrix] = [_identity_scattering_matrix(num_modes)]
-    for block in blocks:
-        prefix_scattering.append(
-            Solver.redheffer_star_product(prefix_scattering[-1], block)
+    if scattering_chains is None:
+        scattering_chains = _build_visualization_scattering_chains(
+            stack,
+            modal_data,
+            verbose=verbose,
         )
-
-    suffix_scattering: list[ScatteringMatrix] = [
-        _identity_scattering_matrix(num_modes) for _ in range(len(blocks) + 1)
-    ]
-    for i in range(len(blocks) - 1, -1, -1):
-        suffix_scattering[i] = Solver.redheffer_star_product(
-            blocks[i],
-            suffix_scattering[i + 1],
-        )
-    _log_timing(verbose, "Built prefix/suffix scattering chains for visualization march", step_start)
+    prefix_scattering = scattering_chains.prefix_scattering
+    suffix_scattering = scattering_chains.suffix_scattering
 
     layer_face_coeffs: list[tuple[jnp.ndarray, jnp.ndarray]] = []
     for i in range(len(modal_data.layer_modes)):
@@ -605,140 +530,22 @@ def _layer_modal_data(
     num_points_rcwa: int,
     verbose: bool,
 ) -> _StackModalData:
-    """Build every modal map needed to reconstruct internal fields.
-
-    This function performs two conceptually separate transformations:
-
-    1. Reorder each layer operator from component-major to harmonic-major:
-
-           Q_harmonic = P Q_component P^T
-
-       where ``P = Solver.reorder_matrix(N)``.
-
-    2. Diagonalize each half-space/layer operator to obtain a matrix whose
-       columns are modal field vectors expressed in the harmonic-major
-       reduced-field basis.
-
-       For isotropic ports, the columns are ordered as
-
-           [forward_TE(-N..N), forward_TM(-N..N),
-            backward_TE(-N..N), backward_TM(-N..N)].
-
-       For internal layers, the columns are ordered as
-
-           [all forward layer modes, all backward layer modes].
-
-    The returned reduced-field matrices are all maps of the form
-
-        field_k = Fields @ modal_coeffs
-
-    with ``field_k`` in harmonic-major reduced-field ordering.
-
-    The cache also stores tangential-field versions of those modal maps for the
-    zero-thickness interface basis changes. Those continuity maps act in
-
-        [-H_y(n), H_x(n), E_y(n), E_x(n)]
-
-    ordering, but only at interfaces; all interior reconstruction remains in
-    the reduced ``D_x`` basis.
-    """
+    """Build the shared solver modal cache needed for field reconstruction."""
     total_start = perf_counter()
     _log(
         verbose,
         (
-            f"Building modal cache for {len(stack.layers)} layer(s): "
+            f"Building shared stack solve data for {len(stack.layers)} layer(s): "
             f"N={N}, num_points_rcwa={num_points_rcwa}"
         ),
     )
-
-    step_start = perf_counter()
-    q_matrices_component_major = stack.build_all_Q_matrices_normalized(
+    modal_data = Solver.build_stack_solve_data(
+        stack,
         N,
         num_points=num_points_rcwa,
+        verbose=verbose,
     )
-    _log_timing(verbose, "Built component-major layer Q matrices", step_start)
-
-    step_start = perf_counter()
-    layer_toeplitz_matrices = [
-        layer.build_toeplitz_fourier_matrices(N, num_points=num_points_rcwa)
-        for layer in stack.layers
-    ]
-    _log_timing(verbose, "Built layer Toeplitz matrices", step_start)
-
-    step_start = perf_counter()
-    q_matrices_harmonic_major = [
-        Solver.component_to_harmonic_major(q_matrix)
-        for q_matrix in q_matrices_component_major
-    ]
-    _log_timing(verbose, "Reordered layer Q matrices into harmonic-major basis", step_start)
-
-    step_start = perf_counter()
-    substrate_fields = Solver.isotropic_mode_fields(
-        stack.get_Q_substrate_normalized(N, num_points=num_points_rcwa),
-        N,
-    )
-    substrate_continuity_fields = Solver.reduced_to_tangential_fields(
-        substrate_fields,
-        Solver.isotropic_reduced_to_tangential_transform_component_major(
-            stack.eps_substrate,
-            N,
-        ),
-    )
-    superstrate_fields = Solver.isotropic_mode_fields(
-        stack.get_Q_superstrate_normalized(N, num_points=num_points_rcwa),
-        N,
-    )
-    superstrate_continuity_fields = Solver.reduced_to_tangential_fields(
-        superstrate_fields,
-        Solver.isotropic_reduced_to_tangential_transform_component_major(
-            stack.eps_superstrate,
-            N,
-        ),
-    )
-    _log_timing(verbose, "Diagonalized isotropic substrate/superstrate port modes", step_start)
-
-    layer_modes: list[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]] = []
-    reference_fields = substrate_fields
-    for i, (q_matrix, toeplitz_matrices) in enumerate(
-        zip(q_matrices_harmonic_major, layer_toeplitz_matrices)
-    ):
-        step_start = perf_counter()
-        eigenvalues, layer_fields = Solver.layer_mode_fields(
-            q_matrix,
-            reference_fields=reference_fields,
-            verbose=verbose,
-        )
-        eigensolve_elapsed = perf_counter() - step_start
-
-        step_start = perf_counter()
-        layer_continuity_fields = Solver.reduced_to_tangential_fields(
-            layer_fields,
-            Layer.build_reduced_to_tangential_field_transform_component_major(
-                toeplitz_matrices,
-                N,
-            ),
-        )
-        continuity_elapsed = perf_counter() - step_start
-        _log(
-            verbose,
-            (
-                f"Layer {i}: mode solve {_format_elapsed_seconds(eigensolve_elapsed)}, "
-                f"continuity map {_format_elapsed_seconds(continuity_elapsed)}"
-            ),
-        )
-        layer_modes.append((eigenvalues, layer_fields, layer_continuity_fields))
-        reference_fields = layer_fields
-
-    modal_data = _StackModalData(
-        q_matrices_component_major=q_matrices_component_major,
-        q_matrices_harmonic_major=q_matrices_harmonic_major,
-        substrate_fields=substrate_fields,
-        superstrate_fields=superstrate_fields,
-        substrate_continuity_fields=substrate_continuity_fields,
-        superstrate_continuity_fields=superstrate_continuity_fields,
-        layer_modes=layer_modes,
-    )
-    _log_timing(verbose, "Built modal cache", total_start)
+    _log_timing(verbose, "Built shared stack solve data", total_start)
     return modal_data
 
 
@@ -829,6 +636,7 @@ def _layer_face_coefficients(
         modal_data=modal_data,
         incident_coeffs=inc,
         stop_after_layer_index=layer_index,
+        scattering_chains=None,
         verbose=verbose,
     )
     if len(layer_face_coeffs) <= layer_index:
@@ -1059,7 +867,8 @@ def compute_visualization_bundle(
 ) -> VisualizationBundle:
     """Compute TE/TM reflection/transmission and ``x-z`` profiles in one batch.
 
-    The expensive modal cache and total scattering matrix are each built once.
+    The expensive shared stack decomposition is built once and reused for both
+    the total scattering matrix and the field reconstruction march.
     For every requested incident polarization, the function stores
 
     - reflected modal amplitudes ``r``
@@ -1101,16 +910,16 @@ def compute_visualization_bundle(
         num_points_rcwa=num_points_rcwa,
         verbose=verbose,
     )
-    _log_timing(verbose, "Built modal cache for visualization bundle", step_start)
+    _log_timing(verbose, "Built shared stack solve data for visualization bundle", step_start)
+    S11, _, S21, _ = modal_data.total_scattering
 
     step_start = perf_counter()
-    S11, _, S21, _ = Solver.total_scattering_matrix(
+    scattering_chains = _build_visualization_scattering_chains(
         stack,
-        N,
-        num_points=num_points_rcwa,
+        modal_data,
         verbose=verbose,
     )
-    _log_timing(verbose, "Built total scattering matrix for visualization bundle", step_start)
+    _log_timing(verbose, "Prepared reusable visualization interface chains", step_start)
 
     polarization_data: dict[str, IncidentVisualizationData] = {}
     for pol in normalized_pols:
@@ -1128,6 +937,7 @@ def compute_visualization_bundle(
             modal_data=modal_data,
             incident_coeffs=inc,
             stop_after_layer_index=None,
+            scattering_chains=scattering_chains,
             verbose=verbose,
         )
         _log_timing(verbose, f"Marched face coefficients for {pol} incidence", step_start)

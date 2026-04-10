@@ -240,6 +240,21 @@ class Layer:
         return self._toeplitz_cache[cache_key]
 
     @staticmethod
+    def _assemble_harmonic_major_from_component_blocks(
+        blocks: list[list[jnp.ndarray]],
+    ) -> jnp.ndarray:
+        """Assemble a dense matrix directly in harmonic-major ordering from component blocks."""
+        block_tensor = jnp.stack(
+            [jnp.stack(row, axis=0) for row in blocks],
+            axis=0,
+        )
+        num_row_blocks, num_col_blocks, num_h_rows, num_h_cols = block_tensor.shape
+        return block_tensor.transpose(2, 0, 3, 1).reshape(
+            num_h_rows * num_row_blocks,
+            num_h_cols * num_col_blocks,
+        )
+
+    @staticmethod
     def build_reduced_to_tangential_field_transform_component_major(
         toeplitz_matrices: dict[str, jnp.ndarray],
         N: int,
@@ -260,7 +275,26 @@ class Layer:
         inv_hat_eps_xx = toeplitz_matrices["inv_hat_eps_xx"]
         inv_hat_eps_xx_hat_eps_xy = toeplitz_matrices["inv_hat_eps_xx_hat_eps_xy"]
 
-        return jnp.block(
+        blocks = [
+            [identity, zero, zero, zero],
+            [zero, identity, zero, zero],
+            [zero, zero, identity, zero],
+            [zero, zero, -inv_hat_eps_xx_hat_eps_xy, inv_hat_eps_xx],
+        ]
+        return jnp.block(blocks)
+
+    @staticmethod
+    def build_reduced_to_tangential_field_transform_harmonic_major(
+        toeplitz_matrices: dict[str, jnp.ndarray],
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the harmonic-major map from ``[-H_y, H_x, E_y, D_x]`` to tangential fields."""
+        num_h = 2 * N + 1
+        identity = jnp.eye(num_h, dtype=jnp.complex128)
+        zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+        inv_hat_eps_xx = toeplitz_matrices["inv_hat_eps_xx"]
+        inv_hat_eps_xx_hat_eps_xy = toeplitz_matrices["inv_hat_eps_xx_hat_eps_xy"]
+        return Layer._assemble_harmonic_major_from_component_blocks(
             [
                 [identity, zero, zero, zero],
                 [zero, identity, zero, zero],
@@ -330,7 +364,51 @@ class Layer:
 
         # Assemble the 4 x 4 block operator acting on the ordered basis
         # [-H_y, H_x, E_y, D_x]^T.
-        return jnp.block(
+        blocks = [
+            [zero, zero, zero, -1j * identity],
+            [1j * a @ K_x, zero, 1j * (K_x_squared - tilde_eps_yy), -1j * b],
+            [zero, -1j * identity, zero, zero],
+            [
+                Q_prime_41,
+                -1j * hat_eps_xy,
+                1j * hat_eps_xx @ K_x @ e,
+                -1j * c @ K_x - 1j * hat_eps_xx @ K_x @ d,
+            ],
+        ]
+        return jnp.block(blocks)
+
+    @staticmethod
+    def build_Q_matrix_harmonic_major_normalized(
+        n_vals: jnp.ndarray,
+        m_vals: jnp.ndarray,
+        kappa_normalized: float,
+        G_normalized: float,
+        fourier_coeffs_dict: FourierCoefficients,
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the full block Q matrix directly in harmonic-major ordering."""
+        _ = (n_vals, m_vals)
+
+        num_h = 2 * N + 1
+        identity = jnp.eye(num_h, dtype=jnp.complex128)
+        zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+        K_x = Layer.build_K_x_diag_matrix(kappa_normalized, G_normalized, N)
+        K_x_squared = K_x @ K_x
+
+        toeplitz_matrices = fourier_coeffs_dict
+        hat_eps_xx = toeplitz_matrices["hat_eps_xx"]
+        hat_eps_xy = toeplitz_matrices["hat_eps_xy"]
+        tilde_eps_yy = toeplitz_matrices["tilde_eps_yy"]
+        eta = toeplitz_matrices["eta"]
+        a = toeplitz_matrices["a"]
+        b = toeplitz_matrices["b"]
+        c = toeplitz_matrices["c"]
+        d = toeplitz_matrices["d"]
+        e = toeplitz_matrices["e"]
+
+        Q_prime_41 = -1j * hat_eps_xx + 1j * hat_eps_xx @ K_x @ eta @ K_x
+
+        return Layer._assemble_harmonic_major_from_component_blocks(
             [
                 [zero, zero, zero, -1j * identity],
                 [1j * a @ K_x, zero, 1j * (K_x_squared - tilde_eps_yy), -1j * b],

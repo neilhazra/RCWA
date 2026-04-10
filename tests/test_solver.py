@@ -490,6 +490,43 @@ def test_isotropic_mode_fields_have_global_forward_backward_split(
     assert jnp.max(jnp.abs(T[half:, :half])) < 1e-10
 
 
+def test_isotropic_mode_fields_with_tangential_transform_match_complex_kx_port_basis() -> None:
+    stack = Stack(
+        wavelength_nm=405.0,
+        kappa_inv_nm=(35.0 + 5.0j) * 1e-3,
+        eps_substrate=1.0,
+        eps_superstrate=1.4696**2,
+    )
+    stack.add_layer(
+        Layer.uniform(
+            thickness_nm=122.0,
+            eps_tensor=jnp.diag(jnp.array([5.406, 10.465 + 1.923j, 1.6**2], dtype=jnp.complex128)),
+            x_domain_nm=(0.0, 500.0),
+        )
+    )
+
+    tangential_transform = Solver.isotropic_reduced_to_tangential_transform_harmonic_major(
+        stack.eps_substrate,
+        0,
+    )
+    tangential_fields = Solver.reduced_to_tangential_fields_harmonic_major(
+        Solver.isotropic_mode_fields(
+            stack.get_Q_substrate_normalized(0),
+            0,
+            tangential_transform=tangential_transform,
+        ),
+        tangential_transform,
+    )
+    expected = _physical_port_fields(stack.eps_substrate, stack.kappa_normalized)[:, [2, 3, 0, 1]]
+
+    for col in range(4):
+        alpha = jnp.vdot(expected[:, col], tangential_fields[:, col]) / jnp.vdot(
+            expected[:, col],
+            expected[:, col],
+        )
+        assert jnp.allclose(tangential_fields[:, col], alpha * expected[:, col], atol=1e-10)
+
+
 def test_layer_mode_sort_uses_overlap_to_break_zeroed_direction_metric_ties(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -849,6 +886,56 @@ def test_uniform_interface_total_scattering_is_finite_and_diagonal(
         assert jnp.all(jnp.isfinite(S21))
         assert jnp.max(jnp.abs(S11 - jnp.diag(jnp.diag(S11)))) < 1e-10
         assert jnp.max(jnp.abs(S21 - jnp.diag(jnp.diag(S21)))) < 1e-10
+
+
+def test_precomputed_stack_solve_data_matches_direct_total_scattering(
+    uniform_interface_stack: Stack,
+) -> None:
+    precomputed = Solver.build_stack_solve_data(
+        uniform_interface_stack,
+        1,
+        num_points=128,
+        verbose=False,
+    )
+    direct = Solver.total_scattering_matrix(
+        uniform_interface_stack,
+        1,
+        num_points=128,
+        verbose=False,
+    )
+    reused = Solver.total_scattering_matrix(
+        uniform_interface_stack,
+        1,
+        num_points=128,
+        verbose=False,
+        precomputed=precomputed,
+    )
+    reflected_direct, transmitted_direct = Solver.reflection_transmission(
+        uniform_interface_stack,
+        1,
+        incident_pol="TE",
+        num_points=128,
+        verbose=False,
+    )
+    reflected_reused, transmitted_reused = Solver.reflection_transmission(
+        uniform_interface_stack,
+        1,
+        incident_pol="TE",
+        num_points=128,
+        verbose=False,
+        precomputed=precomputed,
+    )
+
+    for direct_block, precomputed_block, reused_block in zip(
+        direct,
+        precomputed.total_scattering,
+        reused,
+    ):
+        assert jnp.allclose(precomputed_block, direct_block, atol=1e-12)
+        assert jnp.allclose(reused_block, direct_block, atol=1e-12)
+
+    assert jnp.allclose(reflected_reused, reflected_direct, atol=1e-12)
+    assert jnp.allclose(transmitted_reused, transmitted_direct, atol=1e-12)
 
 
 def test_verbose_total_scattering_matrix_emits_progress_messages(

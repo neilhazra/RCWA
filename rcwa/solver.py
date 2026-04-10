@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as jnp
@@ -11,6 +12,18 @@ from .stack import Stack
 
 
 ScatteringMatrix = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+
+
+@dataclass
+class StackSolveData:
+    """Shared stack decomposition reused by the solver and visualization code."""
+
+    substrate_fields: jnp.ndarray
+    superstrate_fields: jnp.ndarray
+    substrate_continuity_fields: jnp.ndarray
+    superstrate_continuity_fields: jnp.ndarray
+    layer_modes: list[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]
+    total_scattering: ScatteringMatrix
 
 
 class Solver:
@@ -88,6 +101,14 @@ class Solver:
         return transform_harmonic_major @ reduced_fields
 
     @staticmethod
+    def reduced_to_tangential_fields_harmonic_major(
+        reduced_fields: jnp.ndarray,
+        reduced_to_tangential_harmonic_major: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Convert modal fields to tangential fields with a harmonic-major transform."""
+        return reduced_to_tangential_harmonic_major @ reduced_fields
+
+    @staticmethod
     def isotropic_reduced_to_tangential_transform_component_major(
         eps: complex,
         N: int,
@@ -106,6 +127,17 @@ class Solver:
                 [zero, zero, zero, inv_eps],
             ]
         )
+
+    @staticmethod
+    def isotropic_reduced_to_tangential_transform_harmonic_major(
+        eps: complex,
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the isotropic reduced-to-tangential interface map in harmonic-major order."""
+        block = jnp.diag(
+            jnp.array([1.0, 1.0, 1.0, 1.0 / complex(eps)], dtype=jnp.complex128)
+        )
+        return jnp.kron(jnp.eye(Stack.num_harmonics(N), dtype=jnp.complex128), block)
 
     @staticmethod
     def zero_order_mode_index(N: int, incident_pol: str) -> int:
@@ -201,10 +233,39 @@ class Solver:
         return out
 
     @staticmethod
+    def _mode_normal_poynting_flux(tangential_fields: jnp.ndarray) -> jnp.ndarray:
+        """Return Re(Sz) for modal fields in tangential ordering [-H_y, H_x, E_y, E_x]."""
+        if tangential_fields.ndim == 2:
+            if tangential_fields.shape[0] % 4 != 0:
+                raise ValueError(
+                    "Expected tangential fields with row count divisible by 4, "
+                    f"got shape={tangential_fields.shape}."
+                )
+            fields = tangential_fields.reshape(tangential_fields.shape[0] // 4, 4, tangential_fields.shape[1])
+            minus_hy = fields[:, 0, :]
+            hx = fields[:, 1, :]
+            ey = fields[:, 2, :]
+            ex = fields[:, 3, :]
+            return jnp.real(jnp.sum(-ex * jnp.conj(minus_hy) - ey * jnp.conj(hx), axis=0))
+
+        if tangential_fields.ndim == 3 and tangential_fields.shape[1] == 4:
+            minus_hy = tangential_fields[:, 0, :]
+            hx = tangential_fields[:, 1, :]
+            ey = tangential_fields[:, 2, :]
+            ex = tangential_fields[:, 3, :]
+            return jnp.real(-ex * jnp.conj(minus_hy) - ey * jnp.conj(hx))
+
+        raise ValueError(
+            "Expected tangential fields with shape (4*num_h, num_modes) or (num_h, 4, 4), "
+            f"got {tangential_fields.shape}."
+        )
+
+    @staticmethod
     def _sort_layer_eigensystem(
         eigenvalues: jnp.ndarray,
         eigenvectors: jnp.ndarray,
         reference_fields: jnp.ndarray | None,
+        tangential_transform: jnp.ndarray | None,
         tol: float,
         verbose: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -215,10 +276,19 @@ class Solver:
             jnp.imag(eigenvalues),
             -jnp.real(eigenvalues),
         )
+        if tangential_transform is not None:
+            poynting_score = Solver._mode_normal_poynting_flux(
+                tangential_transform @ eigenvectors
+            )
+        else:
+            poynting_score = jnp.zeros(eigenvalues.shape, dtype=jnp.float64)
 
         if reference_fields is None:
-            sort_idx = jnp.argsort(-direction_metric)
-            Solver._log(verbose, "Finished direction-metric sorting without reference-basis overlap")
+            sort_idx = jnp.lexsort((-direction_metric, -poynting_score))
+            Solver._log(
+                verbose,
+                "Finished direction/poynting sorting without reference-basis overlap",
+            )
             return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
         Solver._log(verbose, "Computing reference-basis overlaps for layer mode sorting")
@@ -234,10 +304,12 @@ class Solver:
         )
 
         # numpy.lexsort uses the last key as the primary key. This sorts first
-        # by descending direction metric and then uses reference-basis overlap
-        # to break ties for numerically ambiguous directions.
-        sort_idx = jnp.lexsort((-overlap_score, -direction_metric_for_sort))
-        Solver._log(verbose, "Finished lexicographic forward/backward sorting with overlap tie-break")
+        # by descending Poynting flux, then by descending direction metric, and
+        # finally uses reference-basis overlap to break residual ties.
+        sort_idx = jnp.lexsort(
+            (-overlap_score, -direction_metric_for_sort, -poynting_score)
+        )
+        Solver._log(verbose, "Finished lexicographic forward/backward sorting with Poynting tie-break")
         return eigenvalues[sort_idx], eigenvectors[:, sort_idx]
 
     @staticmethod
@@ -267,7 +339,11 @@ class Solver:
         tm = jnp.where(valid[..., 1, None], pair[..., 1], fallback[..., 1])
         return te, tm
 
-    def diagonalize_sort_isotropic_modes(Q_iso: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    @staticmethod
+    def diagonalize_sort_isotropic_modes(
+        Q_iso: jnp.ndarray,
+        tangential_transform: jnp.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Diagonalize isotropic half-space modes harmonic-by-harmonic.
 
         Returns
@@ -287,7 +363,34 @@ class Solver:
             jnp.imag(eigenvalues),
             -jnp.real(eigenvalues),
         )
-        sort_idx = jnp.argsort(-direction_metric, axis=1)
+        if tangential_transform is None:
+            sort_idx = jnp.argsort(-direction_metric, axis=1)
+        else:
+            transform_blocks = Solver._isotropic_diag_blocks(tangential_transform)
+            poynting_score = jnp.stack(
+                [
+                    Solver._mode_normal_poynting_flux(
+                        transform_blocks[block_idx] @ eigenvectors[block_idx]
+                    )
+                    for block_idx in range(eigenvalues.shape[0])
+                ],
+                axis=0,
+            )
+            # Keep the existing direction metric as the primary classifier and
+            # only use Re(Sz) to break residual ties inside degenerate blocks.
+            sort_idx = jnp.stack(
+                [
+                    jnp.lexsort(
+                        (
+                            -poynting_score[block_idx],
+                            -direction_metric[block_idx],
+                        )
+                    )
+                    for block_idx in range(eigenvalues.shape[0])
+                ],
+                axis=0,
+            )
+
         eigenvalues = jnp.take_along_axis(eigenvalues, sort_idx, axis=1)
         eigenvectors = jnp.take_along_axis(eigenvectors, sort_idx[:, None, :], axis=2)
 
@@ -313,17 +416,21 @@ class Solver:
             raise ValueError(f"Expected eigenvectors with shape (num_h, 4, 4), got {evecs.shape}.")
 
         num_h = int(evecs.shape[0])
-        N = (num_h - 1) // 2
         size = 4 * num_h
         fields = jnp.zeros((size, size), dtype=evecs.dtype)
         for h in range(num_h):
-            fields[4 * h : 4 * (h + 1), 4 * h : 4 * (h + 1)] = evecs[h]
-        return fields[:, Solver.mode_reorder_indices(N)]
+            row_slice = slice(4 * h, 4 * (h + 1))
+            fields[row_slice, h] = evecs[h, :, 0]
+            fields[row_slice, num_h + h] = evecs[h, :, 1]
+            fields[row_slice, 2 * num_h + h] = evecs[h, :, 2]
+            fields[row_slice, 3 * num_h + h] = evecs[h, :, 3]
+        return fields
 
     @staticmethod
     def diagonalize_sort_layer_modes(
         Q: jnp.ndarray,
         reference_fields: jnp.ndarray | None = None,
+        tangential_transform: jnp.ndarray | None = None,
         tol: float = 1e-9,
         verbose: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -361,6 +468,7 @@ class Solver:
             eigenvalues,
             eigenvectors,
             reference_fields=reference_fields,
+            tangential_transform=tangential_transform,
             tol=tol,
             verbose=verbose,
         )
@@ -421,9 +529,16 @@ class Solver:
         )
 
     @staticmethod
-    def isotropic_mode_fields(Q_iso: jnp.ndarray, N: int) -> jnp.ndarray:
+    def isotropic_mode_fields(
+        Q_iso: jnp.ndarray,
+        N: int,
+        tangential_transform: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
         """Return the isotropic half-space fields matrix in the solver's modal ordering."""
-        _, evecs = Solver.diagonalize_sort_isotropic_modes(Q_iso)
+        _, evecs = Solver.diagonalize_sort_isotropic_modes(
+            Q_iso,
+            tangential_transform=tangential_transform,
+        )
         if int(evecs.shape[0]) != Stack.num_harmonics(N):
             raise ValueError(
                 f"Expected {Stack.num_harmonics(N)} harmonics for N={N}, got {evecs.shape[0]}."
@@ -434,12 +549,14 @@ class Solver:
     def layer_mode_fields(
         q_matrix: jnp.ndarray,
         reference_fields: jnp.ndarray,
+        tangential_transform: jnp.ndarray | None = None,
         verbose: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Return sorted layer eigenvalues and the corresponding fields matrix."""
         return Solver.diagonalize_sort_layer_modes(
             q_matrix,
             reference_fields=reference_fields,
+            tangential_transform=tangential_transform,
             verbose=verbose,
         )
 
@@ -515,69 +632,144 @@ class Solver:
         return result
 
     @staticmethod
-    def total_scattering_matrix(
+    def identity_scattering_matrix(num_modes: int) -> ScatteringMatrix:
+        """Return the transparent two-port S-matrix on one modal basis."""
+        identity = jnp.eye(num_modes, dtype=jnp.complex128)
+        zero = jnp.zeros_like(identity)
+        return zero, identity, identity, zero
+
+    @staticmethod
+    def stack_scattering_blocks(
+        stack: Stack,
+        stack_data: StackSolveData,
+    ) -> list[ScatteringMatrix]:
+        """Return the interface and propagation S-matrices for one stack decomposition."""
+        if not stack_data.layer_modes:
+            return [
+                Solver.basis_change_scattering_matrix(
+                    stack_data.substrate_continuity_fields,
+                    stack_data.superstrate_continuity_fields,
+                )
+            ]
+
+        blocks: list[ScatteringMatrix] = [
+            Solver.basis_change_scattering_matrix(
+                stack_data.substrate_continuity_fields,
+                stack_data.layer_modes[0][2],
+            )
+        ]
+
+        for i, (eigenvalues, _, layer_continuity_fields) in enumerate(stack_data.layer_modes):
+            blocks.append(
+                Solver.modal_propagation_scattering_matrix(
+                    eigenvalues,
+                    stack.thickness_normalized(i),
+                )
+            )
+            right_fields = (
+                stack_data.superstrate_continuity_fields
+                if i == len(stack_data.layer_modes) - 1
+                else stack_data.layer_modes[i + 1][2]
+            )
+            blocks.append(
+                Solver.basis_change_scattering_matrix(
+                    layer_continuity_fields,
+                    right_fields,
+                )
+            )
+
+        return blocks
+
+    @staticmethod
+    def scattering_prefix_suffix_chains(
+        blocks: list[ScatteringMatrix],
+    ) -> tuple[list[ScatteringMatrix], list[ScatteringMatrix]]:
+        """Return cumulative left-to-right and right-to-left scattering chains."""
+        if not blocks:
+            raise ValueError("Expected at least one scattering block.")
+
+        num_modes = blocks[0][0].shape[0]
+        prefix_scattering: list[ScatteringMatrix] = [
+            Solver.identity_scattering_matrix(num_modes)
+        ]
+        for block in blocks:
+            prefix_scattering.append(
+                Solver.redheffer_star_product(prefix_scattering[-1], block)
+            )
+
+        suffix_scattering: list[ScatteringMatrix] = [
+            Solver.identity_scattering_matrix(num_modes) for _ in range(len(blocks) + 1)
+        ]
+        for i in range(len(blocks) - 1, -1, -1):
+            suffix_scattering[i] = Solver.redheffer_star_product(
+                blocks[i],
+                suffix_scattering[i + 1],
+            )
+        return prefix_scattering, suffix_scattering
+
+    @staticmethod
+    def build_stack_solve_data(
         stack: Stack,
         N: int,
         num_points: int = 512,
         verbose: bool = False,
-    ) -> ScatteringMatrix:
-        """Return the stack S-matrix in substrate/superstrate modal bases."""
+    ) -> StackSolveData:
+        """Build and cache all modal data needed for one stack solve."""
         Solver._log(
             verbose,
             (
-                f"Building total scattering matrix: N={N}, num_points={num_points}, "
+                f"Building shared stack solve data: N={N}, num_points={num_points}, "
                 f"num_layers={len(stack.layers)}"
             ),
         )
-        q_matrices = stack.build_all_Q_matrices_normalized(N, num_points=num_points)
         layer_toeplitz_matrices = [
             layer.build_toeplitz_fourier_matrices(N, num_points=num_points)
             for layer in stack.layers
         ]
-        Solver._log(verbose, f"Built {len(q_matrices)} component-major layer Q matrices")
-        q_matrices_harmonic_major = [
-            Solver.component_to_harmonic_major(q_matrix) for q_matrix in q_matrices
-        ]
-        if q_matrices_harmonic_major:
-            Solver._log(verbose, "Reordered layer Q matrices into harmonic-major basis")
+        q_matrices_harmonic_major = stack.build_all_Q_matrices_harmonic_major_normalized(
+            N,
+            num_points=num_points,
+        )
+        Solver._log(verbose, f"Built {len(q_matrices_harmonic_major)} harmonic-major layer Q matrices")
 
         Solver._log(verbose, "Diagonalizing isotropic substrate modes")
+        substrate_tangential_transform = Solver.isotropic_reduced_to_tangential_transform_harmonic_major(
+            stack.eps_substrate,
+            N,
+        )
         substrate_fields = Solver.isotropic_mode_fields(
             stack.get_Q_substrate_normalized(N, num_points=num_points),
             N,
+            tangential_transform=substrate_tangential_transform,
         )
-        substrate_continuity_fields = Solver.reduced_to_tangential_fields(
+        substrate_continuity_fields = Solver.reduced_to_tangential_fields_harmonic_major(
             substrate_fields,
-            Solver.isotropic_reduced_to_tangential_transform_component_major(
-                stack.eps_substrate,
-                N,
-            ),
+            substrate_tangential_transform,
         )
         Solver._log(verbose, "Diagonalizing isotropic superstrate modes")
+        superstrate_tangential_transform = Solver.isotropic_reduced_to_tangential_transform_harmonic_major(
+            stack.eps_superstrate,
+            N,
+        )
         superstrate_fields = Solver.isotropic_mode_fields(
             stack.get_Q_superstrate_normalized(N, num_points=num_points),
             N,
+            tangential_transform=superstrate_tangential_transform,
         )
-        superstrate_continuity_fields = Solver.reduced_to_tangential_fields(
+        superstrate_continuity_fields = Solver.reduced_to_tangential_fields_harmonic_major(
             superstrate_fields,
-            Solver.isotropic_reduced_to_tangential_transform_component_major(
-                stack.eps_superstrate,
-                N,
-            ),
+            superstrate_tangential_transform,
         )
-
-        if not q_matrices_harmonic_major:
-            Solver._log(verbose, "No internal layers found; returning direct substrate/superstrate basis change")
-            return Solver.basis_change_scattering_matrix(
-                substrate_continuity_fields,
-                superstrate_continuity_fields,
-            )
 
         layer_modes: list[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]] = []
         reference_fields = substrate_fields
         for i, (q_matrix, toeplitz_matrices) in enumerate(
             zip(q_matrices_harmonic_major, layer_toeplitz_matrices)
         ):
+            layer_tangential_transform = Layer.build_reduced_to_tangential_field_transform_harmonic_major(
+                toeplitz_matrices,
+                N,
+            )
             Solver._log(
                 verbose,
                 f"Diagonalizing layer {i} Q matrix with shape {q_matrix.shape}",
@@ -585,14 +777,12 @@ class Solver:
             eigenvalues, layer_fields = Solver.layer_mode_fields(
                 q_matrix,
                 reference_fields,
+                tangential_transform=layer_tangential_transform,
                 verbose=verbose,
             )
-            layer_continuity_fields = Solver.reduced_to_tangential_fields(
+            layer_continuity_fields = Solver.reduced_to_tangential_fields_harmonic_major(
                 layer_fields,
-                Layer.build_reduced_to_tangential_field_transform_component_major(
-                    toeplitz_matrices,
-                    N,
-                ),
+                layer_tangential_transform,
             )
             layer_modes.append((eigenvalues, layer_fields, layer_continuity_fields))
             reference_fields = layer_fields
@@ -601,41 +791,70 @@ class Solver:
                 f"Sorted layer {i} modes into forward/backward basis ({eigenvalues.shape[0]} eigenvalues)",
             )
 
-        Solver._log(verbose, "Building substrate-to-layer-0 basis-change scattering matrix")
-        S_list: list[ScatteringMatrix] = [
-            Solver.basis_change_scattering_matrix(
+        if not layer_modes:
+            Solver._log(
+                verbose,
+                "No internal layers found; returning direct substrate/superstrate basis change",
+            )
+            total_scattering = Solver.basis_change_scattering_matrix(
                 substrate_continuity_fields,
-                layer_modes[0][2],
+                superstrate_continuity_fields,
             )
-        ]
-
-        for i, (layer_eigenvalues, layer_fields, layer_continuity_fields) in enumerate(layer_modes):
+        else:
+            blocks = Solver.stack_scattering_blocks(
+                stack,
+                StackSolveData(
+                    substrate_fields=substrate_fields,
+                    superstrate_fields=superstrate_fields,
+                    substrate_continuity_fields=substrate_continuity_fields,
+                    superstrate_continuity_fields=superstrate_continuity_fields,
+                    layer_modes=layer_modes,
+                    total_scattering=Solver.identity_scattering_matrix(
+                        2 * Stack.num_harmonics(N)
+                    ),
+                ),
+            )
             Solver._log(
                 verbose,
-                f"Building modal propagation scattering matrix for layer {i} with thickness {stack.thickness_normalized(i):.6g}",
+                f"Concatenating {len(blocks)} scattering matrices with Redheffer star products",
             )
-            S_list.append(
-                Solver.modal_propagation_scattering_matrix(
-                    layer_eigenvalues,
-                    stack.thickness_normalized(i),
-                )
-            )
-            right_fields = (
-                superstrate_continuity_fields
-                if i == len(layer_modes) - 1
-                else layer_modes[i + 1][2]
-            )
-            target_name = "superstrate" if i == len(layer_modes) - 1 else f"layer {i + 1}"
+            total_scattering = Solver.chain_scattering_matrices(blocks)
+
+        return StackSolveData(
+            substrate_fields=substrate_fields,
+            superstrate_fields=superstrate_fields,
+            substrate_continuity_fields=substrate_continuity_fields,
+            superstrate_continuity_fields=superstrate_continuity_fields,
+            layer_modes=layer_modes,
+            total_scattering=total_scattering,
+        )
+
+    @staticmethod
+    def total_scattering_matrix(
+        stack: Stack,
+        N: int,
+        num_points: int = 512,
+        verbose: bool = False,
+        precomputed: StackSolveData | None = None,
+    ) -> ScatteringMatrix:
+        """Return the stack S-matrix in substrate/superstrate modal bases."""
+        if precomputed is None:
             Solver._log(
                 verbose,
-                f"Building basis-change scattering matrix from layer {i} to {target_name}",
+                (
+                    f"Building total scattering matrix: N={N}, num_points={num_points}, "
+                    f"num_layers={len(stack.layers)}"
+                ),
             )
-            S_list.append(
-                Solver.basis_change_scattering_matrix(layer_continuity_fields, right_fields)
+            precomputed = Solver.build_stack_solve_data(
+                stack,
+                N,
+                num_points=num_points,
+                verbose=verbose,
             )
-
-        Solver._log(verbose, f"Concatenating {len(S_list)} scattering matrices with Redheffer star products")
-        return Solver.chain_scattering_matrices(S_list)
+        else:
+            Solver._log(verbose, "Reusing precomputed stack solve data for total scattering matrix")
+        return precomputed.total_scattering
 
     @staticmethod
     def reflection_transmission(
@@ -644,6 +863,7 @@ class Solver:
         incident_pol: str = "TE",
         num_points: int = 512,
         verbose: bool = True,
+        precomputed: StackSolveData | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Return reflected and transmitted modal amplitudes for unit normal incidence."""
         Solver._log(verbose, f"Computing reflection/transmission for {incident_pol.upper()} incidence")
@@ -652,6 +872,7 @@ class Solver:
             N,
             num_points=num_points,
             verbose=verbose,
+            precomputed=precomputed,
         )
         half = 2 * Stack.num_harmonics(N)
 

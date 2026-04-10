@@ -1,7 +1,7 @@
 {
   "_meta": {
     "meep_version": "1.33.0-beta",
-    "rcwa_order": 512,
+    "rcwa_order": 64,
     "rcwa_num_points_x": 320,
     "rcwa_num_points_z": 181,
     "rcwa_num_points_fourier": 4096,
@@ -26,7 +26,7 @@
         "meep_native_max_abs": 1.901727941352213,
         "rms_difference": 0.06531122428569522,
         "max_difference": 0.11099207229443175,
-        "mean_difference": 0.05193190120266053,
+        "mean_difference": 0.05193190120266052,
         "meep_version": "1.33.0-beta"
       },
       "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/uniform_slab_tm_comparison_data.npz",
@@ -36,11 +36,11 @@
   "binary_grating_on_slab": {
     "TE": {
       "metrics": {
-        "rcwa_native_max_abs": 1.3674170930376286,
+        "rcwa_native_max_abs": 1.3674170904077931,
         "meep_native_max_abs": 2.0939175567551693,
-        "rms_difference": 0.0857981101475004,
-        "max_difference": 0.1866281476011511,
-        "mean_difference": 0.07115445809339235,
+        "rms_difference": 0.0857981400024206,
+        "max_difference": 0.18662823524306793,
+        "mean_difference": 0.07115448087714221,
         "meep_version": "1.33.0-beta"
       },
       "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/binary_grating_on_slab_te_comparison_data.npz",
@@ -48,11 +48,11 @@
     },
     "TM": {
       "metrics": {
-        "rcwa_native_max_abs": 2.11807822136331,
+        "rcwa_native_max_abs": 2.1134599696260765,
         "meep_native_max_abs": 4.171357553771537,
-        "rms_difference": 0.05707513038184309,
-        "max_difference": 0.09801552799660701,
-        "mean_difference": 0.049942951308019304,
+        "rms_difference": 0.05753373154788589,
+        "max_difference": 0.09913317723153359,
+        "mean_difference": 0.05025673258283041,
         "meep_version": "1.33.0-beta"
       },
       "comparison_npz": "/Users/neilhazra/Library/Mobile Documents/com~apple~CloudDocs/RCWA/RCWAFFF/meep comparison/output/binary_grating_on_slab_tm_comparison_data.npz",

@@ -119,6 +119,23 @@ class Stack:
             N,
         )
 
+    def layer_Q_matrix_harmonic_major_normalized(
+        self, layer_index: int, N: int, num_points: int = 512
+    ) -> jnp.ndarray:
+        """Build one layer's full normalized Q matrix directly in harmonic-major basis."""
+        toeplitz_matrices = self.layers[layer_index].build_toeplitz_fourier_matrices(
+            N,
+            num_points=num_points,
+        )
+        return Layer.build_Q_matrix_harmonic_major_normalized(
+            self.harmonic_orders(N),
+            self.harmonic_orders(N),
+            self.kappa_normalized,
+            self.G_normalized,
+            toeplitz_matrices,
+            N,
+        )
+
     def layer_Q_tensor_normalized(
         self, layer_index: int, N: int, num_points: int = 512
     ) -> jnp.ndarray:
@@ -158,6 +175,15 @@ class Stack:
         """
         return [
             self.layer_Q_matrix_normalized(i, N, num_points=num_points)
+            for i in range(len(self.layers))
+        ]
+
+    def build_all_Q_matrices_harmonic_major_normalized(
+        self, N: int, num_points: int = 512
+    ) -> list[jnp.ndarray]:
+        """Build every physical-layer Q matrix directly in harmonic-major basis."""
+        return [
+            self.layer_Q_matrix_harmonic_major_normalized(i, N, num_points=num_points)
             for i in range(len(self.layers))
         ]
 

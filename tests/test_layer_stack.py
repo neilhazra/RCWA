@@ -179,6 +179,42 @@ def test_uniform_q_matrix_reorders_to_harmonic_block_diagonal_form(
     assert jnp.allclose(Q_harmonic_major, expected, atol=1e-12)
 
 
+def test_layer_q_harmonic_major_builder_matches_component_major_reorder() -> None:
+    layer = _smooth_diagonal_layer_with_known_spectrum()
+    stack = Stack(wavelength_nm=633.0, kappa_inv_nm=0.07, eps_substrate=1.0, eps_superstrate=1.0)
+    stack.add_layer(layer)
+    N = 2
+
+    q_component_major = stack.layer_Q_matrix_normalized(0, N, num_points=256)
+    q_harmonic_major = stack.layer_Q_matrix_harmonic_major_normalized(0, N, num_points=256)
+
+    assert jnp.allclose(
+        q_harmonic_major,
+        Solver.component_to_harmonic_major(q_component_major),
+        atol=1e-12,
+    )
+
+
+def test_layer_tangential_transform_harmonic_major_matches_component_major_reorder() -> None:
+    layer = _smooth_diagonal_layer_with_known_spectrum()
+    N = 2
+    toeplitz = layer.build_toeplitz_fourier_matrices(N, num_points=256)
+    transform_component_major = Layer.build_reduced_to_tangential_field_transform_component_major(
+        toeplitz,
+        N,
+    )
+    transform_harmonic_major = Layer.build_reduced_to_tangential_field_transform_harmonic_major(
+        toeplitz,
+        N,
+    )
+
+    assert jnp.allclose(
+        transform_harmonic_major,
+        Solver.component_to_harmonic_major(transform_component_major),
+        atol=1e-12,
+    )
+
+
 def test_isotropic_q_matrix_matches_closed_form_uniform_medium_expression(
     uniform_interface_stack: Stack,
 ) -> None:
