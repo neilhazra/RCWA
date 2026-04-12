@@ -368,28 +368,28 @@ class Solver:
         layer_qs = stack.build_all_Q_matrices_normalized(N, num_points)
         in_field = substrate_mode_to_field
         in_field_tang = substrate_tang
-        S_Matrix = []
-        for i,layer in enumerate(layer_qs):
+        S_total = None
+        for i, layer in enumerate(layer_qs):
             layer_tang = stack.layer_reduced_to_tangential_field_transform_component_major(i, N, num_points)
             eigvals, layer_field = Solver.diagonalize_sort_layer_system(layer)
             TMInterface = jnp.linalg.inv(layer_field) @ jnp.linalg.inv(layer_tang) @ in_field_tang @ in_field
             S_Mat_interface = Solver.transfer_to_scattering(TMInterface)
             Modal_prop = Solver.modal_propagation_scattering_matrix(eigvals, stack.thickness_normalized(i))
-            S_Matrix.append(Solver.redheffer_star_product(S_Mat_interface, Modal_prop))
+            S_layer = Solver.redheffer_star_product(S_Mat_interface, Modal_prop)
+            S_total = S_layer if S_total is None else Solver.redheffer_star_product(S_total, S_layer)
             in_field = layer_field
             in_field_tang = layer_tang
-        
+
         out_field = Solver.harmonic_to_component_major_rows(
             Solver.get_superstrate_mode_to_field(stack, N, num_points)
         )
         out_tang = stack.superstrate_reduced_to_tangential_field_transform_component_major(N)
         TMInterface = jnp.linalg.inv(out_field) @ jnp.linalg.inv(out_tang) @ in_field_tang @ in_field
-        
         S_Mat_interface = Solver.transfer_to_scattering(TMInterface)
-        S_Matrix.append(S_Mat_interface)
-        
+        S_total = S_Mat_interface if S_total is None else Solver.redheffer_star_product(S_total, S_Mat_interface)
+
         return (
-            Solver.chain_scattering_matrices(S_Matrix),
+            S_total,
             substrate_mode_to_field, substrate_tang,
             out_field, out_tang,
         )
