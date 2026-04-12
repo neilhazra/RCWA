@@ -136,27 +136,6 @@ class Stack:
             N,
         )
 
-    def layer_Q_tensor_normalized(
-        self, layer_index: int, N: int, num_points: int = 512
-    ) -> jnp.ndarray:
-        """Compatibility wrapper that currently returns the full Q matrix.
-
-        Historically this method returned a tensor with shape
-        ``(num_h, num_h, 4, 4)`` whose ``(n, m)`` entry was the 4x4 block
-        coupling harmonic ``m`` into harmonic ``n``.
-
-        In the rewrite, the layer code directly constructs the flattened full
-        matrix instead, so this method now returns the same object as
-        :meth:`layer_Q_matrix_normalized`:
-
-            shape ``(4 * num_h, 4 * num_h)``
-
-        in the component-major basis
-
-            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T.
-        """
-        return self.layer_Q_matrix_normalized(layer_index, N, num_points=num_points)
-
     def build_all_Q_matrices_normalized(self, N: int, num_points: int = 512) -> list[jnp.ndarray]:
         """Build the full normalized Q matrix for every physical layer.
 
@@ -186,6 +165,33 @@ class Stack:
             self.layer_Q_matrix_harmonic_major_normalized(i, N, num_points=num_points)
             for i in range(len(self.layers))
         ]
+
+    def layer_reduced_to_tangential_field_transform_component_major(
+        self, layer_index: int, N: int, num_points: int = 512
+    ) -> jnp.ndarray:
+        """Build one layer's reduced-to-tangential field transform in component-major basis.
+
+        The returned matrix acts on reduced field vectors ordered as
+
+            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T
+
+        and produces the corresponding tangential field vector
+
+            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), E_x(-N..N)]^T.
+
+        This wrapper threads the stack-normalized in-plane wavevector data
+        ``kappa_normalized`` and ``G_normalized`` into the layer-level builder.
+        """
+        toeplitz_matrices = self.layers[layer_index].build_toeplitz_fourier_matrices(
+            N,
+            num_points=num_points,
+        )
+        return Layer.build_reduced_to_tangential_field_transform_component_major(
+            toeplitz_matrices,
+            N,
+            self.kappa_normalized,
+            self.G_normalized,
+        )
 
     def _build_uniform_medium_Q_normalized(
         self,
@@ -273,4 +279,54 @@ class Stack:
             self.eps_superstrate,
             N,
             num_points=num_points,
+        )
+
+    def _uniform_medium_reduced_to_tangential_field_transform_component_major(
+        self,
+        eps: complex,
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the isotropic reduced-to-tangential map in component-major basis.
+
+        The input and output field orderings are
+
+            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), D_x(-N..N)]^T
+
+        and
+
+            [-H_y(-N..N), H_x(-N..N), E_y(-N..N), E_x(-N..N)]^T,
+
+        respectively. For an isotropic medium, ``E_x = D_x / eps``.
+        """
+        num_h = self.num_harmonics(N)
+        identity = jnp.eye(num_h, dtype=jnp.complex128)
+        zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+        inv_eps = identity / jnp.asarray(eps, dtype=jnp.complex128)
+        return jnp.block(
+            [
+                [identity, zero, zero, zero],
+                [zero, identity, zero, zero],
+                [zero, zero, identity, zero],
+                [zero, zero, zero, inv_eps],
+            ]
+        )
+
+    def substrate_reduced_to_tangential_field_transform_component_major(
+        self,
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the substrate reduced-to-tangential field transform in component-major basis."""
+        return self._uniform_medium_reduced_to_tangential_field_transform_component_major(
+            self.eps_substrate,
+            N,
+        )
+
+    def superstrate_reduced_to_tangential_field_transform_component_major(
+        self,
+        N: int,
+    ) -> jnp.ndarray:
+        """Return the superstrate reduced-to-tangential field transform in component-major basis."""
+        return self._uniform_medium_reduced_to_tangential_field_transform_component_major(
+            self.eps_superstrate,
+            N,
         )

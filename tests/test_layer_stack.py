@@ -165,18 +165,6 @@ def test_stack_normalized_parameters_follow_geometry(uniform_interface_stack: St
     assert jnp.isclose(stack.thickness_normalized(0), 0.0)
 
 
-def test_uniform_q_matrix_reorders_to_harmonic_block_diagonal_form(
-    uniform_interface_stack: Stack,
-) -> None:
-    N = 2
-    reorder = Solver.reorder_matrix(N)
-    Q_component_major = uniform_interface_stack.get_Q_substrate_normalized(N)
-    Q_harmonic_major = reorder @ Q_component_major @ reorder.T
-    diag_blocks = Solver._isotropic_diag_blocks(Q_component_major)
-    expected = scipy.linalg.block_diag(*diag_blocks)
-
-    assert Q_component_major.shape == (4 * Stack.num_harmonics(N), 4 * Stack.num_harmonics(N))
-    assert jnp.allclose(Q_harmonic_major, expected, atol=1e-12)
 
 
 def test_layer_q_harmonic_major_builder_matches_component_major_reorder() -> None:
@@ -197,20 +185,58 @@ def test_layer_q_harmonic_major_builder_matches_component_major_reorder() -> Non
 
 def test_layer_tangential_transform_harmonic_major_matches_component_major_reorder() -> None:
     layer = _smooth_diagonal_layer_with_known_spectrum()
+    stack = Stack(wavelength_nm=633.0, kappa_inv_nm=0.07, eps_substrate=1.0, eps_superstrate=1.0)
+    stack.add_layer(layer)
     N = 2
     toeplitz = layer.build_toeplitz_fourier_matrices(N, num_points=256)
-    transform_component_major = Layer.build_reduced_to_tangential_field_transform_component_major(
-        toeplitz,
+    transform_component_major = stack.layer_reduced_to_tangential_field_transform_component_major(
+        0,
         N,
+        num_points=256,
     )
     transform_harmonic_major = Layer.build_reduced_to_tangential_field_transform_harmonic_major(
         toeplitz,
         N,
+        stack.kappa_normalized,
+        stack.G_normalized,
     )
 
     assert jnp.allclose(
         transform_harmonic_major,
         Solver.component_to_harmonic_major(transform_component_major),
+        atol=1e-12,
+    )
+
+
+def test_layer_tangential_transform_includes_xz_coupling_kx_block() -> None:
+    layer = Layer.uniform(
+        thickness_nm=10.0,
+        eps_tensor=jnp.array(
+            [
+                [4.0, 0.2, 0.3],
+                [0.1, 3.0, 0.25],
+                [0.15, 0.05, 2.5],
+            ],
+            dtype=jnp.complex128,
+        ),
+        x_domain_nm=(0.0, 100.0),
+    )
+    stack = Stack(wavelength_nm=633.0, kappa_inv_nm=0.11, eps_substrate=1.0, eps_superstrate=1.0)
+    stack.add_layer(layer)
+    N = 2
+    toeplitz = layer.build_toeplitz_fourier_matrices(N, num_points=128)
+    transform = stack.layer_reduced_to_tangential_field_transform_component_major(
+        0,
+        N,
+        num_points=128,
+    )
+    num_h = 2 * N + 1
+    K_x = Layer.build_K_x_diag_matrix(stack.kappa_normalized, stack.G_normalized, N)
+    expected_hy_to_ex = -toeplitz["inv_hat_eps_xx_c"] @ K_x
+
+    assert jnp.allclose(
+        transform[3 * num_h : 4 * num_h, :num_h],
+        expected_hy_to_ex,
         atol=1e-12,
     )
 

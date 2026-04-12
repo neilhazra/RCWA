@@ -85,21 +85,30 @@ class Layer:
         # shorthand compound functions below.
         field_quantities["inv_hat_eps_xx"] = 1.0 / field_quantities["hat_eps_xx"]
 
-        # At z-interfaces the continuous tangential field is E_x, not D_x.
-        # For the in-plane anisotropic stacks exercised by this solver path,
+        # At z-interfaces the continuous tangential field is E_x, not D_x. In
+        # the reduced D-field formulation used here,
         #
-        #   D_x(x) = \hat{\epsilon}_{xx}(x) E_x(x) + \hat{\epsilon}_{xy}(x) E_y(x)
+        #   D_x(x) = \hat{\epsilon}_{xx}(x) E_x(x)
+        #            + \hat{\epsilon}_{xy}(x) E_y(x)
+        #            - i \hat{\epsilon}_{xx}(x)
+        #              [\hat{\epsilon}_{xx}^{-1}(x)\epsilon_{xz}(x)\epsilon_{zz}^{-1}(x)]
+        #              K_x (-H_y)(x)
         #
         # so the interface map uses
         #
         #   E_x(x) = \hat{\epsilon}_{xx}^{-1}(x) D_x(x)
-        #            - \hat{\epsilon}_{xx}^{-1}(x)\hat{\epsilon}_{xy}(x) E_y(x).
+        #            - \hat{\epsilon}_{xx}^{-1}(x)\hat{\epsilon}_{xy}(x) E_y(x)
+        #            - [\hat{\epsilon}_{xx}^{-1}(x)\epsilon_{xz}(x)\epsilon_{zz}^{-1}(x)]
+        #              K_x (-H_y)(x).
         #
         # We cache the pointwise product directly so its Fourier-convolution
         # matrix is built from the product spectrum rather than from a product
         # of separately truncated Toeplitz matrices.
         field_quantities["inv_hat_eps_xx_hat_eps_xy"] = (
             field_quantities["inv_hat_eps_xx"] * field_quantities["hat_eps_xy"]
+        )
+        field_quantities["inv_hat_eps_xx_c"] = (
+            field_quantities["inv_hat_eps_xx"] * eps_xz * field_quantities["inv_eps_zz"]
         )
 
         # This is the further-reduced yy entry:
@@ -228,7 +237,6 @@ class Layer:
         if cache_key not in self._toeplitz_cache:
             fourier_coeffs = self.fourier_coefficients(N, num_points=num_points)
             harmonic_orders = jnp.arange(-N, N + 1)
-
             difference_indices = (
                 harmonic_orders[:, None] - harmonic_orders[None, :] + 2 * N
             ).astype(jnp.int32)
@@ -258,6 +266,8 @@ class Layer:
     def build_reduced_to_tangential_field_transform_component_major(
         toeplitz_matrices: dict[str, jnp.ndarray],
         N: int,
+        kappa_normalized: float,
+        G_normalized: float,
     ) -> jnp.ndarray:
         """Return the component-major map from ``[-H_y, H_x, E_y, D_x]`` to tangential fields.
 
@@ -272,14 +282,16 @@ class Layer:
         num_h = 2 * N + 1
         identity = jnp.eye(num_h, dtype=jnp.complex128)
         zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+        K_x = Layer.build_K_x_diag_matrix(kappa_normalized, G_normalized, N)
         inv_hat_eps_xx = toeplitz_matrices["inv_hat_eps_xx"]
         inv_hat_eps_xx_hat_eps_xy = toeplitz_matrices["inv_hat_eps_xx_hat_eps_xy"]
+        inv_hat_eps_xx_c = toeplitz_matrices["inv_hat_eps_xx_c"]
 
         blocks = [
             [identity, zero, zero, zero],
             [zero, identity, zero, zero],
             [zero, zero, identity, zero],
-            [zero, zero, -inv_hat_eps_xx_hat_eps_xy, inv_hat_eps_xx],
+            [-inv_hat_eps_xx_c @ K_x, zero, -inv_hat_eps_xx_hat_eps_xy, inv_hat_eps_xx],
         ]
         return jnp.block(blocks)
 
@@ -287,19 +299,23 @@ class Layer:
     def build_reduced_to_tangential_field_transform_harmonic_major(
         toeplitz_matrices: dict[str, jnp.ndarray],
         N: int,
+        kappa_normalized: float,
+        G_normalized: float,
     ) -> jnp.ndarray:
         """Return the harmonic-major map from ``[-H_y, H_x, E_y, D_x]`` to tangential fields."""
         num_h = 2 * N + 1
         identity = jnp.eye(num_h, dtype=jnp.complex128)
         zero = jnp.zeros((num_h, num_h), dtype=jnp.complex128)
+        K_x = Layer.build_K_x_diag_matrix(kappa_normalized, G_normalized, N)
         inv_hat_eps_xx = toeplitz_matrices["inv_hat_eps_xx"]
         inv_hat_eps_xx_hat_eps_xy = toeplitz_matrices["inv_hat_eps_xx_hat_eps_xy"]
+        inv_hat_eps_xx_c = toeplitz_matrices["inv_hat_eps_xx_c"]
         return Layer._assemble_harmonic_major_from_component_blocks(
             [
                 [identity, zero, zero, zero],
                 [zero, identity, zero, zero],
                 [zero, zero, identity, zero],
-                [zero, zero, -inv_hat_eps_xx_hat_eps_xy, inv_hat_eps_xx],
+                [-inv_hat_eps_xx_c @ K_x, zero, -inv_hat_eps_xx_hat_eps_xy, inv_hat_eps_xx],
             ]
         )
 
